@@ -28,13 +28,35 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python3 auditor.py <target>
+python3 auditor.py <target> [<target> ...]
 ```
 
-Target can be a hostname or an IP address:
+Target can be a hostname or an IP address. Multiple targets are scanned in sequence:
 ```bash
-python3 auditor.py 192.168.1.10
+# Single target
 python3 auditor.py example.com
+python3 auditor.py 192.168.1.10
+
+# Multiple targets
+python3 auditor.py host1 host2 192.168.1.10
+
+# Read targets from a file (one per line, # for comments)
+python3 auditor.py -f hosts.txt
+
+# Save results to CSV
+python3 auditor.py example.com --csv report.csv
+python3 auditor.py -f hosts.txt --csv report.csv
+```
+
+### hosts.txt format
+
+```
+# production servers
+example.com
+192.168.1.10
+
+# test targets
+scanme.nmap.org
 ```
 
 ## What it checks
@@ -119,6 +141,34 @@ Results from two real targets — a well-hardened server and a deliberately misc
 ¹ See root login note above — github.com requires a valid key, so this is a false positive in practice.
 
 `scanme.nmap.org` is a server maintained by the Nmap project for testing purposes and is intentionally poorly configured, making it a useful target to verify that the tool correctly identifies weak settings.
+
+### Multi-host summary
+
+When scanning more than one target a summary table is printed after all audits:
+
+```
+╔══════════════════════════════════════════╗
+  Multi-host summary
+  Host                      PASS    FAIL   Total
+  ────────────────────────────────────────
+  github.com                  26       1      27
+  scanme.nmap.org             29      18      47
+╚══════════════════════════════════════════╝
+```
+
+### CSV export
+
+Use `--csv <file>` to save all results to a CSV file. Each row is one check:
+
+```
+host,category,check,result,detail
+github.com,Port Check,Port 22 (SSH),PASS,open
+github.com,SSH Algorithms,curve25519-sha256,PASS,
+github.com,SSH Root Login,Root login,FAIL,enabled — server offered auth methods: publickey
+...
+```
+
+Useful for importing into spreadsheets or filtering with tools like `grep`, `awk`, or pandas.
 
 ## Output legend
 
