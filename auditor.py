@@ -8,6 +8,7 @@ Checks one or more target servers for:
   - SSH banner / server version
   - SSH root login status
   - SSH password authentication
+  - SSH legacy hardware detection (HP iLO, Cisco, Dropbear, etc.)
   - TLS version support (1.0, 1.1, 1.2, 1.3)
   - TLS certificate (trust, expiry, hostname match)
   - HTTP → HTTPS redirect and HSTS header
@@ -40,19 +41,17 @@ import paramiko.message
 
 # ── Module-level configuration ─────────────────────────────────────────────────
 
-# Connection timeout in seconds — overridden by --timeout at runtime.
 _timeout: int = 5
-
-# Check groups for --only filtering.
 CHECK_GROUPS = ("ports", "ssh", "tls", "http")
 
 
 # ── Thread-local result tracking ───────────────────────────────────────────────
-#
-# Each thread running run_audit() gets its own host, category, and counts so
-# that parallel scans do not clobber each other's state.
 
 _thread_local = threading.local()
+
+# Serialises the KEXINIT monkey-patch in check_ssh_algorithms and
+# check_ssh_legacy so parallel threads do not overwrite each other's patch.
+_kex_patch_lock = threading.Lock()
 
 
 def _host() -> str:
@@ -73,8 +72,6 @@ def _reset_counts() -> None:
     _thread_local.counts = {"pass": 0, "fail": 0}
 
 
-# Shared results list — appended to by all threads. list.append() is atomic
-# in CPython (GIL), but we use a lock to be explicit about the intent.
 _results: list[dict] = []
 _results_lock = threading.Lock()
 
@@ -82,15 +79,14 @@ _results_lock = threading.Lock()
 # ── Result helpers ─────────────────────────────────────────────────────────────
 
 def _record(result: str, label: str, detail: str) -> None:
-    row = {
-        "host":     _host(),
-        "category": _category(),
-        "check":    label,
-        "result":   result,
-        "detail":   detail,
-    }
     with _results_lock:
-        _results.append(row)
+        _results.append({
+            "host":     _host(),
+            "category": _category(),
+            "check":    label,
+            "result":   result,
+            "detail":   detail,
+        })
 
 
 def passed(label: str, detail: str = "") -> None:
@@ -117,6 +113,220 @@ def info(label: str, detail: str = "") -> None:
     if detail:
         line += f" — {detail}"
     print(line)
+
+
+# ── Legacy device fingerprint database ─────────────────────────────────────────
+#
+# Each entry describes one class of device or implementation. Matching is done
+# in two ways:
+#
+#   Banner match   — any banner_hint substring found (case-insensitive) in the
+#                    SSH version string. High confidence.
+#
+#   Algorithm fingerprint — at least one kex_indicator is present in the server's
+#                    advertised KEX list, AND none of the kex_modern_absent algos
+#                    are present (to avoid false positives on servers that support
+#                    both legacy and modern algorithms), AND at least one
+#                    cipher_indicator is present (if the set is non-empty).
+#                    Medium confidence.
+#
+# insecure_kex / insecure_ciphers — subsets of algorithms from this device that
+# should be flagged as [FAIL] when present and have no modern counterpart.
+
+_LEGACY_FINGERPRINTS: list[dict] = [
+    # ── Banner-matched (high confidence) ───────────────────────────────────────
+    {
+        "name":              "Dropbear SSH",
+        "banner_hints":      ["dropbear"],
+        "kex_indicators":    set(),
+        "kex_modern_absent": set(),
+        "cipher_indicators": set(),
+        "note": (
+            "Lightweight SSH daemon common in embedded devices (routers, NAS, IoT). "
+            "Verify firmware is current and check vendor security advisories."
+        ),
+        "insecure_kex":     set(),
+        "insecure_ciphers": set(),
+    },
+    {
+        "name":              "Cisco IOS / IOS-XE",
+        "banner_hints":      ["cisco"],
+        "kex_indicators":    {"diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1"},
+        "kex_modern_absent": {"curve25519-sha256", "ecdh-sha2-nistp256"},
+        "cipher_indicators": set(),
+        "note": (
+            "Enable SSHv2 with modern crypto: 'ip ssh version 2'. "
+            "Refer to the Cisco SSH hardening guide and upgrade IOS."
+        ),
+        "insecure_kex":     {"diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1"},
+        "insecure_ciphers": {"3des-cbc", "aes128-cbc", "aes256-cbc"},
+    },
+    {
+        "name":              "Fortinet FortiGate",
+        "banner_hints":      ["fgssh", "fortissh", "fortigate"],
+        "kex_indicators":    set(),
+        "kex_modern_absent": set(),
+        "cipher_indicators": set(),
+        "note": (
+            "Fortinet appliance — ensure FortiOS is current and SSH crypto "
+            "is hardened under System > Config > SSH."
+        ),
+        "insecure_kex":     set(),
+        "insecure_ciphers": set(),
+    },
+    {
+        "name":              "Juniper JunOS",
+        "banner_hints":      ["jnpr", "junos"],
+        "kex_indicators":    set(),
+        "kex_modern_absent": set(),
+        "cipher_indicators": set(),
+        "note": (
+            "Juniper appliance — verify Junos SSH configuration and "
+            "apply current security advisories."
+        ),
+        "insecure_kex":     set(),
+        "insecure_ciphers": set(),
+    },
+    # ── Algorithm-fingerprinted (medium confidence) ────────────────────────────
+    {
+        "name": "HP iLO 2 / iLO 3 or similar legacy BMC",
+        # iLO uses a generic OpenSSH banner — no banner hint available.
+        # Identified by: only SHA-1 KEX, CBC ciphers, no ECDH or curve25519.
+        "banner_hints":      [],
+        "kex_indicators":    {"diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1"},
+        "kex_modern_absent": {
+            "curve25519-sha256", "ecdh-sha2-nistp256",
+            "ecdh-sha2-nistp384", "ecdh-sha2-nistp521",
+        },
+        "cipher_indicators": {"aes128-cbc", "3des-cbc"},
+        "note": (
+            "Likely a legacy BMC or embedded management interface (HP iLO 2/3, "
+            "Dell iDRAC, or similar). Upgrade firmware to the latest supported version. "
+            "If SSH remains unusable, use HTTPS/RIBCL for remote management."
+        ),
+        "insecure_kex":     {"diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1"},
+        "insecure_ciphers": {"aes128-cbc", "aes256-cbc", "3des-cbc"},
+    },
+    {
+        "name": "Generic legacy embedded firmware",
+        # Catch-all: only group1-sha1 KEX, no modern KEX at all.
+        "banner_hints":      [],
+        "kex_indicators":    {"diffie-hellman-group1-sha1"},
+        "kex_modern_absent": {
+            "curve25519-sha256", "ecdh-sha2-nistp256",
+            "ecdh-sha2-nistp384", "ecdh-sha2-nistp521",
+            "diffie-hellman-group14-sha1",  # even this is absent — truly minimal
+        },
+        "cipher_indicators": set(),
+        "note": (
+            "Only group1-sha1 KEX with no modern alternatives — likely very old "
+            "embedded firmware or an EOL network appliance. Replace or isolate."
+        ),
+        "insecure_kex":     {"diffie-hellman-group1-sha1"},
+        "insecure_ciphers": set(),
+    },
+]
+
+# Sets used for the "no modern alternative" FAIL check, independent of any
+# specific device fingerprint.
+_MODERN_KEX = {
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+    "diffie-hellman-group-exchange-sha256",
+    "sntrup761x25519-sha512",
+    "sntrup761x25519-sha512@openssh.com",
+}
+_LEGACY_KEX = {
+    "diffie-hellman-group1-sha1",
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group-exchange-sha1",
+}
+_LEGACY_CIPHERS = {
+    "arcfour", "arcfour128", "arcfour256",
+    "3des-cbc", "blowfish-cbc", "cast128-cbc",
+    "aes128-cbc", "aes192-cbc", "aes256-cbc",
+}
+
+
+def _match_fingerprint(
+    banner: str, kex: list[str], ciphers: list[str]
+) -> tuple[dict | None, str]:
+    """Return the best-matching fingerprint and how it was matched.
+
+    Returns:
+        (fingerprint_dict, match_method) where match_method is
+        "banner" or "fingerprint", or (None, "") if no match.
+    """
+    kex_set    = set(kex)
+    cipher_set = set(ciphers)
+    banner_lc  = banner.lower()
+
+    for fp in _LEGACY_FINGERPRINTS:
+        # ── Banner match ───────────────────────────────────────────────────────
+        if fp["banner_hints"] and any(h in banner_lc for h in fp["banner_hints"]):
+            return fp, "banner"
+
+        # ── Algorithm fingerprint ──────────────────────────────────────────────
+        if not fp["kex_indicators"]:
+            continue  # needs a banner hint — skip
+
+        kex_hit     = bool(fp["kex_indicators"] & kex_set)
+        modern_gone = not bool(fp["kex_modern_absent"] & kex_set)
+        cipher_hit  = (not fp["cipher_indicators"]) or bool(fp["cipher_indicators"] & cipher_set)
+
+        if kex_hit and modern_gone and cipher_hit:
+            return fp, "fingerprint"
+
+    return None, ""
+
+
+# ── SSH KEXINIT capture helper ──────────────────────────────────────────────────
+
+def _capture_kexinit(target: str) -> tuple[dict, str]:
+    """Open an SSH connection, capture the server's KEXINIT algorithm lists and
+    the version banner, then close the connection.
+
+    Uses _kex_patch_lock to serialise the Transport._parse_kex_init monkey-patch
+    so that parallel scans do not overwrite each other's patched method.
+
+    Returns:
+        (captured, banner) where captured is a dict with keys kex/ciphers/macs,
+        or ({}, "") on connection failure.
+    """
+    captured: dict[str, list] = {}
+    banner   = ""
+
+    original = paramiko.Transport._parse_kex_init
+
+    def capturing(self, m):
+        copy = paramiko.message.Message(m.asbytes())
+        copy.get_bytes(16)
+        captured["kex"]     = copy.get_list()
+        copy.get_list()
+        captured["ciphers"] = copy.get_list()
+        copy.get_list()
+        captured["macs"]    = copy.get_list()
+        original(self, m)
+
+    transport = None
+    with _kex_patch_lock:
+        paramiko.Transport._parse_kex_init = capturing
+        try:
+            transport = paramiko.Transport((target, 22))
+            transport.start_client(timeout=_timeout)
+            banner = transport.remote_version or ""
+        except Exception:
+            pass
+        finally:
+            paramiko.Transport._parse_kex_init = original
+
+    if transport:
+        transport.close()
+
+    return captured, banner
 
 
 # ── Checks ─────────────────────────────────────────────────────────────────────
@@ -146,9 +356,10 @@ def check_open_ports(target: str) -> None:
 def check_ssh_algorithms(target: str) -> None:
     """Connect to SSH and enumerate accepted key exchange, cipher, and MAC algorithms.
 
-    Patches Transport._parse_kex_init to read a copy of the server's KEXINIT packet
-    before paramiko processes it. The KEXINIT message lists every algorithm the server
-    supports, not just the one that gets negotiated.
+    Captures the server's KEXINIT message via _capture_kexinit(). The KEXINIT
+    lists every algorithm the server supports, not just the one that gets
+    negotiated. Each algorithm is checked against known weak sets and reported
+    as [PASS] or [FAIL].
     """
     _thread_local.category = "SSH Algorithms"
     print("\n[SSH Algorithms]")
@@ -168,30 +379,7 @@ def check_ssh_algorithms(target: str) -> None:
         "umac-64@openssh.com",
     }
 
-    captured: dict[str, list] = {}
-    original_parse_kex_init = paramiko.Transport._parse_kex_init
-
-    def capturing_parse_kex_init(self, m):
-        copy = paramiko.message.Message(m.asbytes())
-        copy.get_bytes(16)
-        captured["kex"]     = copy.get_list()
-        copy.get_list()
-        captured["ciphers"] = copy.get_list()
-        copy.get_list()
-        captured["macs"]    = copy.get_list()
-        original_parse_kex_init(self, m)
-
-    paramiko.Transport._parse_kex_init = capturing_parse_kex_init
-    transport = None
-    try:
-        transport = paramiko.Transport((target, 22))
-        transport.start_client(timeout=_timeout)
-    except Exception:
-        pass
-    finally:
-        paramiko.Transport._parse_kex_init = original_parse_kex_init
-        if transport:
-            transport.close()
+    captured, _ = _capture_kexinit(target)
 
     if not captured:
         failed("Could not retrieve algorithm list from server")
@@ -222,26 +410,16 @@ def check_ssh_banner(target: str) -> None:
       >= 8.0 — [PASS]: current enough for most environments
 
     Note: Linux distros sometimes backport security patches without bumping
-    the upstream version number, so a low version does not always mean
-    unpatched. Treat the result as a prompt to verify, not a definitive verdict.
+    the upstream version number. Treat a low version as a prompt to verify,
+    not a definitive verdict.
 
-    Non-OpenSSH implementations (Dropbear, custom banners) are reported as
-    [INFO] only — no version threshold is applied.
+    Non-OpenSSH implementations (Dropbear, custom banners) are shown as [INFO]
+    only — no version threshold is applied since their release cycles differ.
     """
     _thread_local.category = "SSH Banner"
     print("\n[SSH Banner]")
 
-    transport = None
-    try:
-        transport = paramiko.Transport((target, 22))
-        transport.start_client(timeout=_timeout)
-        banner = transport.remote_version or ""
-    except Exception as e:
-        info("SSH server version", f"could not connect — {e}")
-        return
-    finally:
-        if transport:
-            transport.close()
+    _, banner = _capture_kexinit(target)
 
     if not banner:
         info("SSH server version", "no banner received")
@@ -253,10 +431,9 @@ def check_ssh_banner(target: str) -> None:
         return
 
     try:
-        raw = banner.split("OpenSSH_")[1].split()[0]   # "9.2p1"
-        numeric = raw.split("p")[0]                     # "9.2"
-        parts = numeric.split(".")
-        major = int(parts[0])
+        raw     = banner.split("OpenSSH_")[1].split()[0]   # "9.2p1"
+        numeric = raw.split("p")[0]                         # "9.2"
+        major   = int(numeric.split(".")[0])
     except (IndexError, ValueError):
         info("OpenSSH version", "could not parse version number")
         return
@@ -273,14 +450,11 @@ def check_ssh_root_login(target: str) -> None:
     auth_none("root") asks the server to authenticate root using the 'none'
     method (no credentials). Two distinct responses are possible:
 
-      BadAuthenticationType — server replied "I won't accept 'none', but here
-          are the methods I DO accept (password, publickey, ...)". This means
-          the server is actively processing authentication for root. Root login
-          is enabled. [FAIL]
+      BadAuthenticationType — server replied with a list of accepted methods.
+          Root login is enabled. [FAIL]
 
-      AuthenticationException — server rejected the request outright without
-          offering any alternative methods. Root login is likely disabled
-          (PermitRootLogin no). [PASS]
+      AuthenticationException — server rejected root outright.
+          Root login is likely disabled (PermitRootLogin no). [PASS]
 
     Note: BadAuthenticationType is a subclass of AuthenticationException, so
     it must be caught first.
@@ -313,19 +487,10 @@ def check_ssh_root_login(target: str) -> None:
 def check_ssh_password_auth(target: str) -> None:
     """Probe whether password authentication is enabled on port 22.
 
-    Sends an auth_password request using an obviously fake username and
-    password. Two outcomes are possible:
+    Sends an auth_password request with an obviously fake username and password.
 
-      BadAuthenticationType — the server rejected the password method outright
-          and replied with a list of accepted methods (e.g. publickey only).
-          Password authentication is disabled. [PASS]
-
-      AuthenticationException (not BadAuthenticationType) — the server
-          accepted the password method but rejected the credentials as wrong.
-          Password authentication is enabled. [FAIL]
-
-    Password authentication should be disabled on hardened servers. Key-based
-    auth is strictly stronger and immune to brute-force and credential stuffing.
+      BadAuthenticationType — password auth is disabled. [PASS]
+      AuthenticationException — password auth is enabled, credentials wrong. [FAIL]
 
     Note: BadAuthenticationType is a subclass of AuthenticationException, so
     it must be caught first.
@@ -357,6 +522,84 @@ def check_ssh_password_auth(target: str) -> None:
             transport.close()
 
 
+def check_ssh_legacy(target: str) -> None:
+    """Identify potential legacy or embedded hardware by SSH algorithm fingerprint.
+
+    Makes a single SSH connection to capture both the KEXINIT algorithm list and
+    the server banner, then runs them against the device fingerprint database.
+
+    Matching is attempted in two ways:
+
+      Banner match (high confidence) — a known vendor string is found in the SSH
+          version string: "dropbear", "cisco", "FGSSH", etc.
+
+      Algorithm fingerprint (medium confidence) — the server advertises at least
+          one indicator KEX algorithm (e.g. group14-sha1), none of the modern
+          algorithms that a patched server would have (curve25519, ECDH), and
+          at least one indicator cipher (e.g. aes128-cbc). Used to identify
+          HP iLO 2/3 and similar BMCs that hide behind a generic OpenSSH banner.
+
+    A matched device is reported as [INFO] with a remediation note.
+
+    Two additional [FAIL] checks run independently of device identification:
+      - No modern KEX available: only deprecated key exchange with no modern
+        alternative means the connection cannot be made secure regardless of
+        configuration on the client side.
+      - No modern ciphers available: only CBC/RC4 modes advertised.
+    """
+    _thread_local.category = "SSH Legacy Detection"
+    print("\n[SSH Legacy Detection]")
+
+    captured, banner = _capture_kexinit(target)
+
+    if not captured:
+        info("Legacy detection", "could not retrieve algorithm list")
+        return
+
+    kex     = captured.get("kex", [])
+    ciphers = captured.get("ciphers", [])
+    kex_set = set(kex)
+    cph_set = set(ciphers)
+
+    # ── Device identification ──────────────────────────────────────────────────
+    fp, method = _match_fingerprint(banner, kex, ciphers)
+
+    if fp:
+        confidence = "identified by banner" if method == "banner" else "identified by algorithm fingerprint"
+        info("Device fingerprint", f"{fp['name']} ({confidence})")
+        info("Recommendation", fp["note"])
+
+        # Flag insecure algorithms specific to this device that are present
+        # and have no modern counterpart in the same category.
+        legacy_kex_present    = fp["insecure_kex"]    & kex_set
+        legacy_ciphers_present = fp["insecure_ciphers"] & cph_set
+        has_modern_kex    = bool(_MODERN_KEX & kex_set)
+        has_modern_ciphers = bool(cph_set - _LEGACY_CIPHERS)
+
+        if legacy_kex_present and not has_modern_kex:
+            failed("Legacy KEX only",
+                   f"device supports only: {', '.join(sorted(legacy_kex_present))}")
+        if legacy_ciphers_present and not has_modern_ciphers:
+            failed("Legacy ciphers only",
+                   f"device supports only: {', '.join(sorted(legacy_ciphers_present))}")
+    else:
+        # ── Standalone legacy checks (no specific device match) ────────────────
+        has_legacy_kex    = bool(_LEGACY_KEX & kex_set)
+        has_modern_kex    = bool(_MODERN_KEX & kex_set)
+        has_modern_ciphers = bool(cph_set - _LEGACY_CIPHERS)
+
+        if has_legacy_kex and not has_modern_kex:
+            legacy_present = sorted(_LEGACY_KEX & kex_set)
+            failed("No modern key exchange available",
+                   f"only deprecated KEX advertised: {', '.join(legacy_present)}")
+        if ciphers and not has_modern_ciphers:
+            failed("No modern ciphers available",
+                   "only deprecated cipher modes (CBC/RC4) advertised")
+
+        if not (has_legacy_kex and not has_modern_kex) and not (ciphers and not has_modern_ciphers):
+            passed("Legacy detection", "no known legacy device fingerprint detected")
+
+
 def check_tls_versions(target: str) -> None:
     """Attempt a TLS handshake for each version against port 443.
 
@@ -364,14 +607,6 @@ def check_tls_versions(target: str) -> None:
     maximum_version on a fresh SSLContext, forcing the handshake to use only
     that version. TLS 1.0 and 1.1 are deprecated (RFC 8996) and should be
     disabled on any server — a successful handshake for either is a [FAIL].
-
-    Two separate failure modes are distinguished:
-      - Local SSL policy blocks the version (Fedora DEFAULT/FUTURE crypto policy
-        disables TLS 1.0/1.1 at the OpenSSL level) → context setup raises SSLError
-      - Server rejects the version → wrap_socket raises SSLError
-
-    Both are reported as [INFO] not supported since we cannot reach the server
-    with that version either way.
     """
     _thread_local.category = "TLS Version Support"
     print("\n[TLS Version Support]")
@@ -419,19 +654,9 @@ def check_tls_versions(target: str) -> None:
 def check_tls_certificate(target: str) -> None:
     """Retrieve the TLS certificate from port 443 and check:
 
-      - Trust: chain verified against system CA bundle. SSLCertVerificationError
-        (self-signed, expired, unknown CA, etc.) reported as [FAIL] with the
-        human-readable reason extracted from the OpenSSL error string.
+      - Trust: chain verified against system CA bundle.
       - Expiry: [FAIL] if expired or < 30 days, [INFO] if < 90 days.
-      - Hostname match: SAN list (DNS + IP) checked against target with
-        wildcard support; falls back to CN if no SANs present.
-
-    create_default_context() is used to load the system CA bundle and keep
-    CERT_REQUIRED (default), which makes getpeercert() return the full parsed
-    certificate dict on a successful handshake.
-
-    check_hostname is disabled in the context so that we can perform the
-    hostname check ourselves and produce a more informative error message.
+      - Hostname match: SAN list (DNS + IP) checked against target.
     """
     _thread_local.category = "TLS Certificate"
     print("\n[TLS Certificate]")
@@ -466,12 +691,10 @@ def check_tls_certificate(target: str) -> None:
         info("TLS Certificate", "no certificate data returned")
         return
 
-    # ── Trust ────────────────────────────────────────────────────────────────────
     issuer = dict(x[0] for x in cert.get("issuer", []))
     issuer_name = issuer.get("organizationName") or issuer.get("commonName", "unknown")
     passed("Certificate trust", f"issued by {issuer_name}")
 
-    # ── Expiry ───────────────────────────────────────────────────────────────────
     try:
         not_after = datetime.datetime.strptime(
             cert["notAfter"], "%b %d %H:%M:%S %Y %Z"
@@ -494,7 +717,6 @@ def check_tls_certificate(target: str) -> None:
     except (KeyError, ValueError):
         info("Certificate expiry", "could not parse expiry date")
 
-    # ── Hostname match ────────────────────────────────────────────────────────────
     subject = dict(x[0] for x in cert.get("subject", []))
     if _is_ip(target):
         ip_sans = [addr for kind, addr in cert.get("subjectAltName", [])
@@ -529,19 +751,10 @@ def check_tls_certificate(target: str) -> None:
 
 
 def check_http_security(target: str) -> None:
-    """Check HTTP→HTTPS redirect behaviour and HSTS header on port 443.
-
-    HTTP redirect — a GET to port 80 should return a 3xx redirect to an
-    https:// URL. Anything else (200, redirect to http, no redirect) is a FAIL.
-
-    HSTS — the Strict-Transport-Security header must be present on the HTTPS
-    response. max-age should be at least 180 days (15 552 000 seconds); shorter
-    values give browsers too small a window to remember to use HTTPS.
-    """
+    """Check HTTP→HTTPS redirect behaviour and HSTS header on port 443."""
     _thread_local.category = "HTTP Security"
     print("\n[HTTP Security]")
 
-    # ── HTTP → HTTPS redirect ─────────────────────────────────────────────────
     try:
         conn = http.client.HTTPConnection(target, 80, timeout=_timeout)
         conn.request("GET", "/", headers={"Host": target,
@@ -562,7 +775,6 @@ def check_http_security(target: str) -> None:
     except (socket.timeout, OSError) as e:
         info("HTTP → HTTPS redirect", f"could not reach port 80 — {e}")
 
-    # ── HSTS ──────────────────────────────────────────────────────────────────
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -610,15 +822,10 @@ def check_http_security(target: str) -> None:
         info("HSTS header", f"could not reach port 443 — {e}")
 
 
-# ── TLS / hostname helpers ──────────────────────────────────────────────────────
+# ── TLS / hostname helpers ─────────────────────────────────────────────────────
 
 def _hostname_matches(target: str, names: list[str]) -> bool:
-    """Return True if target matches any name in the list.
-
-    Handles exact matches and single-label wildcards (*.example.com).
-    Wildcard matching follows RFC 6125: the wildcard covers exactly one label
-    and only in the leftmost position.
-    """
+    """Return True if target matches any name (supports *.example.com wildcards)."""
     target = target.lower()
     for name in names:
         name = name.lower()
@@ -626,7 +833,7 @@ def _hostname_matches(target: str, names: list[str]) -> bool:
             return True
         if name.startswith("*."):
             suffix = name[1:]
-            rest = target[: -len(suffix)]
+            rest   = target[: -len(suffix)]
             if target.endswith(suffix) and "." not in rest:
                 return True
     return False
@@ -655,20 +862,14 @@ def write_csv(path: str) -> None:
 # ── Per-host audit ─────────────────────────────────────────────────────────────
 
 def run_audit(target: str, only: set[str] | None = None) -> None:
-    """Run all (or a subset of) checks against target and print the results.
-
-    Args:
-        target: hostname or IP address to audit.
-        only:   set of group names to run (ports / ssh / tls / http).
-                None means run all groups.
-    """
+    """Run all (or a subset of) checks against target and print the results."""
     _thread_local.host = target
     _reset_counts()
 
     all_groups = only is None
 
-    title = f"SSH/TLS Auditor — target: {target}"
-    width = max(38, len(title) + 2)
+    title  = f"SSH/TLS Auditor — target: {target}"
+    width  = max(38, len(title) + 2)
     border = "═" * width
     print(f"\n╔{border}╗")
     print(f"  {title}")
@@ -681,13 +882,14 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         check_ssh_banner(target)
         check_ssh_root_login(target)
         check_ssh_password_auth(target)
+        check_ssh_legacy(target)
     if all_groups or "tls" in only:
         check_tls_versions(target)
         check_tls_certificate(target)
     if all_groups or "http" in only:
         check_http_security(target)
 
-    c = _counts()
+    c     = _counts()
     total = c["pass"] + c["fail"]
     print(f"\n╔{border}╗")
     print(f"  Summary — {total} checks")
@@ -700,11 +902,7 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
 
 
 def run_audit_buffered(target: str, only: set[str] | None) -> str:
-    """Run run_audit() with stdout captured to a string and return it.
-
-    Used by parallel scanning so that each host's output is collected
-    complete and then printed in submission order, avoiding interleaved lines.
-    """
+    """Run run_audit() with stdout captured and return it as a string."""
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         run_audit(target, only)
@@ -729,13 +927,13 @@ def print_multi_summary(targets: list[str]) -> None:
             host_counts[h]["fail"] += 1
 
     col_width = max(len(h) for h in targets) + 2
-    border = "═" * (col_width + 26)
+    border    = "═" * (col_width + 26)
     print(f"\n╔{border}╗")
     print("  Multi-host summary")
     print(f"  {'Host':<{col_width}} {'PASS':>6}  {'FAIL':>6}  {'Total':>6}")
     print(f"  {'─' * (col_width + 24)}")
     for h in targets:
-        c = host_counts.get(h, {"pass": 0, "fail": 0})
+        c     = host_counts.get(h, {"pass": 0, "fail": 0})
         total = c["pass"] + c["fail"]
         print(f"  {h:<{col_width}} {c['pass']:>6}  {c['fail']:>6}  {total:>6}")
     print(f"╚{border}╝")
@@ -756,43 +954,31 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "targets",
-        nargs="*",
-        metavar="TARGET",
+        "targets", nargs="*", metavar="TARGET",
         help="hostname(s) or IP address(es) to audit",
     )
     parser.add_argument(
-        "-f", "--file",
-        metavar="FILE",
+        "-f", "--file", metavar="FILE",
         help="read targets from a file, one per line (# comments supported)",
     )
     parser.add_argument(
-        "--csv",
-        metavar="FILE",
+        "--csv", metavar="FILE",
         help="write results to a CSV file after all audits complete",
     )
     parser.add_argument(
-        "--timeout",
-        type=int,
-        default=5,
-        metavar="SECONDS",
+        "--timeout", type=int, default=5, metavar="SECONDS",
         help="connection timeout in seconds (default: 5)",
     )
     parser.add_argument(
-        "--only",
-        nargs="+",
-        choices=list(CHECK_GROUPS),
-        metavar="GROUP",
+        "--only", nargs="+", choices=list(CHECK_GROUPS), metavar="GROUP",
         help=f"run only the specified check group(s): {', '.join(CHECK_GROUPS)}",
     )
     parser.add_argument(
-        "--parallel",
-        action="store_true",
+        "--parallel", action="store_true",
         help="scan multiple targets in parallel (default: sequential)",
     )
     args = parser.parse_args()
 
-    # Apply timeout globally before any checks run.
     global _timeout
     _timeout = args.timeout
 
@@ -815,9 +1001,6 @@ def main() -> None:
         sys.exit(1)
 
     if args.parallel and len(targets) > 1:
-        # Each target runs in its own thread with stdout buffered.
-        # Futures are submitted in order and printed in order so the output
-        # is deterministic regardless of which thread finishes first.
         max_workers = min(len(targets), 20)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(run_audit_buffered, t, only) for t in targets]
