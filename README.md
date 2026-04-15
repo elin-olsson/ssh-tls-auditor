@@ -16,7 +16,7 @@ python3 --version
 
 Clone the repository and navigate to the tool directory:
 ```bash
-git clone https://github.com/elin-olsson/ssh-tls-auditor.git
+git clone https://github.com/YOUR_USERNAME/ssh-tls-auditor.git
 cd ssh-tls-auditor
 ```
 
@@ -64,7 +64,7 @@ python3 auditor.py -f hosts.txt --parallel --timeout 3
 | Group | Checks included |
 |---|---|
 | `ports` | Port 22, 80, 443 |
-| `ssh` | SSH algorithms, banner/version, root login, password auth |
+| `ssh` | SSH algorithms, banner/version, root login, password auth, legacy detection |
 | `tls` | TLS versions, certificate trust/expiry/hostname |
 | `http` | HTTP → HTTPS redirect, HSTS header |
 
@@ -88,6 +88,7 @@ scanme.nmap.org
 | SSH banner / version | Reads `transport.remote_version` | OpenSSH ≥ 8.0 (or non-OpenSSH) |
 | SSH root login | `auth_none("root")` probe via paramiko | Server rejects root outright |
 | SSH password auth | `auth_password` probe with fake credentials | Server rejects password method |
+| SSH legacy detection | Banner + algorithm fingerprint against device DB | No known legacy device fingerprint |
 | TLS versions | TLS handshake per version via `ssl` | 1.2/1.3 supported, 1.0/1.1 disabled |
 | TLS certificate trust | Full chain verification against system CA bundle | Issued by a trusted CA |
 | TLS certificate expiry | Parsed from `notAfter` field | Valid for > 90 days |
@@ -104,6 +105,19 @@ scanme.nmap.org
 > **Note:** This check can produce a false positive on servers that only accept public key authentication for root (e.g. GitHub). The server responds with `publickey` as an accepted method, which triggers `[FAIL]` — but without a valid key, root access is still not possible. The result should be interpreted in context.
 
 **SSH password auth check** — sends an `auth_password` request with obviously fake credentials. If the server rejects the password method entirely (`BadAuthenticationType`), password authentication is disabled (`[PASS]`). If it rejects the credentials but accepts the method, password authentication is enabled (`[FAIL]`) and the server is susceptible to brute-force and credential stuffing attacks.
+
+**SSH legacy detection** — fingerprints the server using a combination of its SSH banner string and the algorithm set advertised in KEXINIT. Matches against a built-in database of known device types:
+
+| Device | Match method |
+|---|---|
+| Dropbear SSH | Banner: `dropbear` |
+| Cisco IOS / IOS-XE | Banner: `cisco` + legacy KEX |
+| Fortinet FortiGate | Banner: `FGSSH` / `fortissh` |
+| Juniper JunOS | Banner: `jnpr` / `junos` |
+| HP iLO 2 / iLO 3 (and similar BMCs) | Algorithm fingerprint: SHA-1 KEX only + CBC ciphers + no ECDH/curve25519 |
+| Generic legacy embedded firmware | Algorithm fingerprint: group1-sha1 only, nothing modern |
+
+A matched device is reported as `[INFO]` with a remediation note. If the device advertises **only** deprecated key exchange algorithms with no modern alternative, this is reported as `[FAIL]` — the session cannot be made secure regardless of client configuration.
 
 **TLS version check** — attempts a handshake using each TLS version in isolation. TLS 1.2 and 1.3 connecting is a `[PASS]`. TLS 1.0 or 1.1 connecting is a `[FAIL]` — deprecated per RFC 8996 and should be disabled on any server.
 
