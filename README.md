@@ -128,7 +128,18 @@ scanme.nmap.org
 
 A matched device is reported as `[INFO]` with a remediation note. If the device advertises **only** deprecated key exchange algorithms with no modern alternative, this is reported as `[FAIL]` — the session cannot be made secure regardless of client configuration.
 
-**TLS version check** — attempts a handshake using each TLS version in isolation. TLS 1.2 and 1.3 connecting is a `[PASS]`. TLS 1.0 or 1.1 connecting is a `[FAIL]` — deprecated per RFC 8996 and should be disabled on any server.
+**TLS version check** — attempts a TLS handshake for each version in isolation by forcing both the minimum and maximum version on a fresh SSL context. This ensures only that specific version is negotiated, not the highest mutually supported one. TLS 1.2 and 1.3 are `[PASS]`. TLS 1.0 and 1.1 are `[FAIL]` — deprecated per RFC 8996 and disabled by default in modern browsers and libraries. If a version is not supported by the local Python/OpenSSL build (e.g. TLS 1.0 on hardened systems), the check is reported as `[INFO]`.
+
+**TLS certificate check** — retrieves the certificate from port 443 and verifies three things:
+
+- **Trust** — the full certificate chain is verified against the system CA bundle (same as what a browser uses). A self-signed or untrusted certificate is `[FAIL]`.
+- **Expiry** — the `notAfter` field is parsed and compared to today. Expired or expiring within 30 days is `[FAIL]`. Expiring within 90 days is `[INFO]` — a prompt to plan renewal. Valid beyond 90 days is `[PASS]`.
+- **Hostname match** — the certificate's Subject Alternative Names (SANs) are checked against the target. Both DNS names (with wildcard support) and IP addresses are handled. A mismatch is `[FAIL]`.
+
+**HTTP security check** — two checks covering the basics of secure HTTP configuration:
+
+- **HTTP → HTTPS redirect** — sends a `GET /` request on port 80 and checks for a 3xx redirect to an `https://` URL. A missing redirect means traffic can be intercepted in cleartext (`[FAIL]`).
+- **HSTS header** — sends a `HEAD /` request on port 443 and checks for a `Strict-Transport-Security` header. The `max-age` must be at least 180 days (15,552,000 seconds) to pass. HSTS tells browsers to always use HTTPS for the domain, preventing downgrade attacks.
 
 ## Example output
 
