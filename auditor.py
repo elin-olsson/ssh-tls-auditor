@@ -5,56 +5,96 @@ ssh-tls-auditor — SSH and TLS misconfiguration auditor
 Checks one or more target servers for:
   - Open ports (22, 80, 443)
   - SSH algorithms (key exchange, ciphers, MACs)
+  - SSH banner / server version
   - SSH root login status
+  - SSH password authentication
   - TLS version support (1.0, 1.1, 1.2, 1.3)
+  - TLS certificate (trust, expiry, hostname match)
+  - HTTP → HTTPS redirect and HSTS header
 
 Usage:
     python3 auditor.py <target> [<target> ...]
     python3 auditor.py -f hosts.txt
     python3 auditor.py example.com 192.168.1.10 --csv report.csv
+    python3 auditor.py -f hosts.txt --parallel --timeout 10
+    python3 auditor.py example.com --only ssh tls
 """
 
 import argparse
+import concurrent.futures
+import contextlib
 import csv
 import datetime
 import http.client
+import io
 import ipaddress
 import socket
 import ssl
 import sys
+import threading
 import warnings
 
 import paramiko
 import paramiko.message
 
 
-# ── Result tracking ────────────────────────────────────────────────────────────
+# ── Module-level configuration ─────────────────────────────────────────────────
 
-_counts: dict[str, int] = {"pass": 0, "fail": 0}
-_results: list[dict] = []
-_current_host: str = ""
-_current_category: str = ""
+# Connection timeout in seconds — overridden by --timeout at runtime.
+_timeout: int = 5
+
+# Check groups for --only filtering.
+CHECK_GROUPS = ("ports", "ssh", "tls", "http")
+
+
+# ── Thread-local result tracking ───────────────────────────────────────────────
+#
+# Each thread running run_audit() gets its own host, category, and counts so
+# that parallel scans do not clobber each other's state.
+
+_thread_local = threading.local()
+
+
+def _host() -> str:
+    return getattr(_thread_local, "host", "")
+
+
+def _category() -> str:
+    return getattr(_thread_local, "category", "")
+
+
+def _counts() -> dict[str, int]:
+    if not hasattr(_thread_local, "counts"):
+        _thread_local.counts = {"pass": 0, "fail": 0}
+    return _thread_local.counts
 
 
 def _reset_counts() -> None:
-    _counts["pass"] = 0
-    _counts["fail"] = 0
+    _thread_local.counts = {"pass": 0, "fail": 0}
+
+
+# Shared results list — appended to by all threads. list.append() is atomic
+# in CPython (GIL), but we use a lock to be explicit about the intent.
+_results: list[dict] = []
+_results_lock = threading.Lock()
 
 
 # ── Result helpers ─────────────────────────────────────────────────────────────
 
 def _record(result: str, label: str, detail: str) -> None:
-    _results.append({
-        "host":     _current_host,
-        "category": _current_category,
+    row = {
+        "host":     _host(),
+        "category": _category(),
         "check":    label,
         "result":   result,
         "detail":   detail,
-    })
+    }
+    with _results_lock:
+        _results.append(row)
 
 
 def passed(label: str, detail: str = "") -> None:
-    _counts["pass"] += 1
+    _counts()["pass"] += 1
     _record("PASS", label, detail)
     line = f"  [PASS]  {label}"
     if detail:
@@ -63,7 +103,7 @@ def passed(label: str, detail: str = "") -> None:
 
 
 def failed(label: str, detail: str = "") -> None:
-    _counts["fail"] += 1
+    _counts()["fail"] += 1
     _record("FAIL", label, detail)
     line = f"  [FAIL]  {label}"
     if detail:
@@ -83,19 +123,14 @@ def info(label: str, detail: str = "") -> None:
 
 def check_open_ports(target: str) -> None:
     """Check whether ports 22, 80, and 443 are open on the target."""
-    global _current_category
-    _current_category = "Port Check"
+    _thread_local.category = "Port Check"
     print("\n[Port Check]")
 
-    ports = {
-        22:  "SSH",
-        80:  "HTTP",
-        443: "HTTPS",
-    }
+    ports = {22: "SSH", 80: "HTTP", 443: "HTTPS"}
     for port, label in ports.items():
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3)
+            sock.settimeout(_timeout)
             result = sock.connect_ex((target, port))
             sock.close()
             if result == 0:
@@ -115,8 +150,7 @@ def check_ssh_algorithms(target: str) -> None:
     before paramiko processes it. The KEXINIT message lists every algorithm the server
     supports, not just the one that gets negotiated.
     """
-    global _current_category
-    _current_category = "SSH Algorithms"
+    _thread_local.category = "SSH Algorithms"
     print("\n[SSH Algorithms]")
 
     WEAK_KEX = {
@@ -138,24 +172,22 @@ def check_ssh_algorithms(target: str) -> None:
     original_parse_kex_init = paramiko.Transport._parse_kex_init
 
     def capturing_parse_kex_init(self, m):
-        # asbytes() returns the full buffer from position 0 regardless of
-        # the read cursor — safe to copy without disturbing the original.
         copy = paramiko.message.Message(m.asbytes())
-        copy.get_bytes(16)                       # skip 16-byte cookie
-        captured["kex"]     = copy.get_list()   # kex algorithms
-        copy.get_list()                          # host key algorithms (skip)
-        captured["ciphers"] = copy.get_list()   # ciphers client→server
-        copy.get_list()                          # ciphers server→client (skip)
-        captured["macs"]    = copy.get_list()   # MACs client→server
-        original_parse_kex_init(self, m)         # original m is untouched
+        copy.get_bytes(16)
+        captured["kex"]     = copy.get_list()
+        copy.get_list()
+        captured["ciphers"] = copy.get_list()
+        copy.get_list()
+        captured["macs"]    = copy.get_list()
+        original_parse_kex_init(self, m)
 
     paramiko.Transport._parse_kex_init = capturing_parse_kex_init
     transport = None
     try:
         transport = paramiko.Transport((target, 22))
-        transport.start_client(timeout=5)
+        transport.start_client(timeout=_timeout)
     except Exception:
-        pass  # kexinit may still have been captured before the exception
+        pass
     finally:
         paramiko.Transport._parse_kex_init = original_parse_kex_init
         if transport:
@@ -193,17 +225,16 @@ def check_ssh_banner(target: str) -> None:
     the upstream version number, so a low version does not always mean
     unpatched. Treat the result as a prompt to verify, not a definitive verdict.
 
-    Non-OpenSSH implementations (Dropbear, libssh, etc.) are reported as
-    [INFO] — no version threshold is applied since their release cycles differ.
+    Non-OpenSSH implementations (Dropbear, custom banners) are reported as
+    [INFO] only — no version threshold is applied.
     """
-    global _current_category
-    _current_category = "SSH Banner"
+    _thread_local.category = "SSH Banner"
     print("\n[SSH Banner]")
 
     transport = None
     try:
         transport = paramiko.Transport((target, 22))
-        transport.start_client(timeout=5)
+        transport.start_client(timeout=_timeout)
         banner = transport.remote_version or ""
     except Exception as e:
         info("SSH server version", f"could not connect — {e}")
@@ -219,25 +250,64 @@ def check_ssh_banner(target: str) -> None:
     info("SSH server version", banner)
 
     if "OpenSSH_" not in banner:
-        # Dropbear, libssh, etc. — no version threshold applied
         return
 
     try:
-        # Banner format: SSH-2.0-OpenSSH_9.2p1[ distro-info]
         raw = banner.split("OpenSSH_")[1].split()[0]   # "9.2p1"
         numeric = raw.split("p")[0]                     # "9.2"
         parts = numeric.split(".")
         major = int(parts[0])
-        minor = int(parts[1]) if len(parts) > 1 else 0
     except (IndexError, ValueError):
         info("OpenSSH version", "could not parse version number")
         return
 
     if major < 8:
-        failed("OpenSSH version",
-               f"{raw} — outdated (< 8.0), upgrade recommended")
+        failed("OpenSSH version", f"{raw} — outdated (< 8.0), upgrade recommended")
     else:
         passed("OpenSSH version", f"{raw} — current")
+
+
+def check_ssh_root_login(target: str) -> None:
+    """Probe whether root login is enabled by sending a 'none' auth request.
+
+    auth_none("root") asks the server to authenticate root using the 'none'
+    method (no credentials). Two distinct responses are possible:
+
+      BadAuthenticationType — server replied "I won't accept 'none', but here
+          are the methods I DO accept (password, publickey, ...)". This means
+          the server is actively processing authentication for root. Root login
+          is enabled. [FAIL]
+
+      AuthenticationException — server rejected the request outright without
+          offering any alternative methods. Root login is likely disabled
+          (PermitRootLogin no). [PASS]
+
+    Note: BadAuthenticationType is a subclass of AuthenticationException, so
+    it must be caught first.
+    """
+    _thread_local.category = "SSH Root Login"
+    print("\n[SSH Root Login]")
+
+    transport = None
+    try:
+        transport = paramiko.Transport((target, 22))
+        transport.start_client(timeout=_timeout)
+        transport.auth_none("root")
+        failed("Root login", "enabled — authenticated as root with no credentials")
+
+    except paramiko.BadAuthenticationType as e:
+        methods = ", ".join(e.allowed_types) if e.allowed_types else "unknown"
+        failed("Root login", f"enabled — server offered auth methods: {methods}")
+
+    except paramiko.AuthenticationException:
+        passed("Root login", "disabled — server rejected auth for root")
+
+    except Exception as e:
+        info("Root login", f"could not determine — {e}")
+
+    finally:
+        if transport:
+            transport.close()
 
 
 def check_ssh_password_auth(target: str) -> None:
@@ -260,78 +330,27 @@ def check_ssh_password_auth(target: str) -> None:
     Note: BadAuthenticationType is a subclass of AuthenticationException, so
     it must be caught first.
     """
-    global _current_category
-    _current_category = "SSH Password Auth"
+    _thread_local.category = "SSH Password Auth"
     print("\n[SSH Password Auth]")
 
     transport = None
     try:
         transport = paramiko.Transport((target, 22))
-        transport.start_client(timeout=5)
+        transport.start_client(timeout=_timeout)
         transport.auth_password("__audit_probe__", "__audit_wrong_pw_12345__")
-        # auth_password succeeded — highly unexpected, but report it
         failed("Password authentication",
                "enabled — probe credentials unexpectedly authenticated")
 
     except paramiko.BadAuthenticationType:
-        # Server does not accept password auth at all
         passed("Password authentication",
                "disabled — server does not accept password authentication")
 
     except paramiko.AuthenticationException:
-        # Server accepted the method, rejected credentials → password auth is on
         failed("Password authentication",
                "enabled — server accepts password authentication")
 
     except Exception as e:
         info("Password authentication", f"could not determine — {e}")
-
-    finally:
-        if transport:
-            transport.close()
-
-
-def check_ssh_root_login(target: str) -> None:
-    """Probe whether root login is enabled by sending a 'none' auth request.
-
-    auth_none("root") asks the server to authenticate root using the 'none'
-    method (no credentials). Two distinct responses are possible:
-
-      BadAuthenticationType — server replied "I won't accept 'none', but here
-          are the methods I DO accept (password, publickey, ...)". This means
-          the server is actively processing authentication for root. Root login
-          is enabled. [FAIL]
-
-      AuthenticationException — server rejected the request outright without
-          offering any alternative methods. Root login is likely disabled
-          (PermitRootLogin no). [PASS]
-
-    Note: BadAuthenticationType is a subclass of AuthenticationException, so
-    it must be caught first.
-    """
-    global _current_category
-    _current_category = "SSH Root Login"
-    print("\n[SSH Root Login]")
-
-    transport = None
-    try:
-        transport = paramiko.Transport((target, 22))
-        transport.start_client(timeout=5)
-        transport.auth_none("root")
-        # auth_none succeeded — root logged in with no credentials at all
-        failed("Root login", "enabled — authenticated as root with no credentials")
-
-    except paramiko.BadAuthenticationType as e:
-        # Server is willing to authenticate root, just wants a different method
-        methods = ", ".join(e.allowed_types) if e.allowed_types else "unknown"
-        failed("Root login", f"enabled — server offered auth methods: {methods}")
-
-    except paramiko.AuthenticationException:
-        # Server rejected root outright — PermitRootLogin no
-        passed("Root login", "disabled — server rejected auth for root")
-
-    except Exception as e:
-        info("Root login", f"could not determine — {e}")
 
     finally:
         if transport:
@@ -354,13 +373,9 @@ def check_tls_versions(target: str) -> None:
     Both are reported as [INFO] not supported since we cannot reach the server
     with that version either way.
     """
-    global _current_category
-    _current_category = "TLS Version Support"
+    _thread_local.category = "TLS Version Support"
     print("\n[TLS Version Support]")
 
-    # (enum value, label, should_succeed)
-    # should_succeed=True  → PASS if handshake works, INFO if not
-    # should_succeed=False → FAIL if handshake works, PASS if rejected
     versions = [
         (getattr(ssl.TLSVersion, "TLSv1",   None), "TLS 1.0", False),
         (getattr(ssl.TLSVersion, "TLSv1_1", None), "TLS 1.1", False),
@@ -373,9 +388,6 @@ def check_tls_versions(target: str) -> None:
             info(label, "not available in this Python/OpenSSL build")
             continue
 
-        # Build a context pinned to exactly this TLS version.
-        # Suppress deprecation warnings for TLS 1.0/1.1 — we probe them
-        # intentionally to check whether the server incorrectly allows them.
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
@@ -389,7 +401,7 @@ def check_tls_versions(target: str) -> None:
             continue
 
         try:
-            with socket.create_connection((target, 443), timeout=5) as raw:
+            with socket.create_connection((target, 443), timeout=_timeout) as raw:
                 with ctx.wrap_socket(raw):
                     if should_succeed:
                         passed(label, "supported")
@@ -404,73 +416,35 @@ def check_tls_versions(target: str) -> None:
             info(label, f"could not reach port 443 — {e}")
 
 
-# ── TLS certificate helpers ────────────────────────────────────────────────────
-
-def _hostname_matches(target: str, names: list[str]) -> bool:
-    """Return True if target matches any name in the list.
-
-    Handles exact matches and single-label wildcards (*.example.com).
-    Wildcard matching follows RFC 6125: the wildcard covers exactly one label
-    and only in the leftmost position.
-    """
-    target = target.lower()
-    for name in names:
-        name = name.lower()
-        if name == target:
-            return True
-        if name.startswith("*."):
-            suffix = name[1:]           # ".example.com"
-            rest = target[: -len(suffix)]
-            if target.endswith(suffix) and "." not in rest:
-                return True
-    return False
-
-
-def _is_ip(s: str) -> bool:
-    try:
-        ipaddress.ip_address(s)
-        return True
-    except ValueError:
-        return False
-
-
-# ── New checks ─────────────────────────────────────────────────────────────────
-
 def check_tls_certificate(target: str) -> None:
     """Retrieve the TLS certificate from port 443 and check:
 
-      - Expiry date (FAIL if expired or < 30 days, INFO if < 90 days)
-      - Self-signed (issuer == subject is a FAIL for public-facing servers)
-      - Hostname match (cert must cover the target hostname/IP via SANs or CN)
+      - Trust: chain verified against system CA bundle. SSLCertVerificationError
+        (self-signed, expired, unknown CA, etc.) reported as [FAIL] with the
+        human-readable reason extracted from the OpenSSL error string.
+      - Expiry: [FAIL] if expired or < 30 days, [INFO] if < 90 days.
+      - Hostname match: SAN list (DNS + IP) checked against target with
+        wildcard support; falls back to CN if no SANs present.
+
+    create_default_context() is used to load the system CA bundle and keep
+    CERT_REQUIRED (default), which makes getpeercert() return the full parsed
+    certificate dict on a successful handshake.
+
+    check_hostname is disabled in the context so that we can perform the
+    hostname check ourselves and produce a more informative error message.
     """
-    global _current_category
-    _current_category = "TLS Certificate"
+    _thread_local.category = "TLS Certificate"
     print("\n[TLS Certificate]")
 
-    # create_default_context() loads the system CA bundle and sets
-    # CERT_REQUIRED by default, which makes getpeercert() return the full
-    # parsed certificate dict on success.
-    #
-    # We disable check_hostname here and perform the hostname check ourselves
-    # against the SAN list — this produces a more informative error message
-    # than OpenSSL's generic one, and lets trust and hostname be separate
-    # findings.
-    #
-    # SSLCertVerificationError is raised for any chain problem (self-signed,
-    # expired, unknown CA, revoked). We extract a readable reason from the
-    # error string and report it as a single FAIL, then return — without a
-    # trusted cert dict, expiry and hostname checks cannot run.
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
 
     cert = None
     try:
-        with socket.create_connection((target, 443), timeout=5) as raw:
+        with socket.create_connection((target, 443), timeout=_timeout) as raw:
             with ctx.wrap_socket(raw, server_hostname=target) as ssock:
                 cert = ssock.getpeercert()
     except ssl.SSLCertVerificationError as e:
-        # Extract the human-readable reason from the OpenSSL error string:
-        # "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: <reason> (_ssl.c:NNN)"
         msg = str(e)
         if "certificate verify failed:" in msg:
             reason = msg.split("certificate verify failed:")[1].split("(")[0].strip()
@@ -493,13 +467,11 @@ def check_tls_certificate(target: str) -> None:
         return
 
     # ── Trust ────────────────────────────────────────────────────────────────────
-    # Reaching here means CERT_REQUIRED passed — the cert is signed by a
-    # trusted CA and the chain is valid.
     issuer = dict(x[0] for x in cert.get("issuer", []))
     issuer_name = issuer.get("organizationName") or issuer.get("commonName", "unknown")
     passed("Certificate trust", f"issued by {issuer_name}")
 
-    # ── Expiry ──────────────────────────────────────────────────────────────────
+    # ── Expiry ───────────────────────────────────────────────────────────────────
     try:
         not_after = datetime.datetime.strptime(
             cert["notAfter"], "%b %d %H:%M:%S %Y %Z"
@@ -522,9 +494,9 @@ def check_tls_certificate(target: str) -> None:
     except (KeyError, ValueError):
         info("Certificate expiry", "could not parse expiry date")
 
-    # ── Hostname match ──────────────────────────────────────────────────────────
+    # ── Hostname match ────────────────────────────────────────────────────────────
+    subject = dict(x[0] for x in cert.get("subject", []))
     if _is_ip(target):
-        # For IP addresses, check the IP SAN list
         ip_sans = [addr for kind, addr in cert.get("subjectAltName", [])
                    if kind == "IP Address"]
         if target in ip_sans:
@@ -548,7 +520,6 @@ def check_tls_certificate(target: str) -> None:
                 failed("Hostname match",
                        f"certificate does not cover {target} — SANs: {preview}")
         else:
-            # Fall back to CN (legacy, no SANs present)
             cn = subject.get("commonName", "")
             if cn and _hostname_matches(target, [cn]):
                 passed("Hostname match", f"certificate CN matches {target}")
@@ -567,13 +538,12 @@ def check_http_security(target: str) -> None:
     response. max-age should be at least 180 days (15 552 000 seconds); shorter
     values give browsers too small a window to remember to use HTTPS.
     """
-    global _current_category
-    _current_category = "HTTP Security"
+    _thread_local.category = "HTTP Security"
     print("\n[HTTP Security]")
 
-    # ── HTTP → HTTPS redirect ───────────────────────────────────────────────────
+    # ── HTTP → HTTPS redirect ─────────────────────────────────────────────────
     try:
-        conn = http.client.HTTPConnection(target, 80, timeout=5)
+        conn = http.client.HTTPConnection(target, 80, timeout=_timeout)
         conn.request("GET", "/", headers={"Host": target,
                                           "User-Agent": "ssh-tls-auditor"})
         resp = conn.getresponse()
@@ -592,13 +562,13 @@ def check_http_security(target: str) -> None:
     except (socket.timeout, OSError) as e:
         info("HTTP → HTTPS redirect", f"could not reach port 80 — {e}")
 
-    # ── HSTS ────────────────────────────────────────────────────────────────────
+    # ── HSTS ──────────────────────────────────────────────────────────────────
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
     try:
-        conn = http.client.HTTPSConnection(target, 443, timeout=5, context=ctx)
+        conn = http.client.HTTPSConnection(target, 443, timeout=_timeout, context=ctx)
         conn.request("HEAD", "/", headers={"Host": target,
                                            "User-Agent": "ssh-tls-auditor"})
         resp = conn.getresponse()
@@ -609,7 +579,6 @@ def check_http_security(target: str) -> None:
             failed("HSTS header", "Strict-Transport-Security not present")
             return
 
-        # Parse max-age value
         max_age: int | None = None
         for part in hsts.split(";"):
             part = part.strip()
@@ -620,7 +589,7 @@ def check_http_security(target: str) -> None:
                     pass
 
         include_subdomains = "includesubdomains" in hsts.lower()
-        MIN_MAX_AGE = 15_552_000  # 180 days in seconds
+        MIN_MAX_AGE = 15_552_000  # 180 days
 
         if max_age is None:
             failed("HSTS header", f"present but max-age could not be parsed: {hsts}")
@@ -641,6 +610,36 @@ def check_http_security(target: str) -> None:
         info("HSTS header", f"could not reach port 443 — {e}")
 
 
+# ── TLS / hostname helpers ──────────────────────────────────────────────────────
+
+def _hostname_matches(target: str, names: list[str]) -> bool:
+    """Return True if target matches any name in the list.
+
+    Handles exact matches and single-label wildcards (*.example.com).
+    Wildcard matching follows RFC 6125: the wildcard covers exactly one label
+    and only in the leftmost position.
+    """
+    target = target.lower()
+    for name in names:
+        name = name.lower()
+        if name == target:
+            return True
+        if name.startswith("*."):
+            suffix = name[1:]
+            rest = target[: -len(suffix)]
+            if target.endswith(suffix) and "." not in rest:
+                return True
+    return False
+
+
+def _is_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
 # ── CSV export ─────────────────────────────────────────────────────────────────
 
 def write_csv(path: str) -> None:
@@ -655,10 +654,18 @@ def write_csv(path: str) -> None:
 
 # ── Per-host audit ─────────────────────────────────────────────────────────────
 
-def run_audit(target: str) -> None:
-    global _current_host
-    _current_host = target
+def run_audit(target: str, only: set[str] | None = None) -> None:
+    """Run all (or a subset of) checks against target and print the results.
+
+    Args:
+        target: hostname or IP address to audit.
+        only:   set of group names to run (ports / ssh / tls / http).
+                None means run all groups.
+    """
+    _thread_local.host = target
     _reset_counts()
+
+    all_groups = only is None
 
     title = f"SSH/TLS Auditor — target: {target}"
     width = max(38, len(title) + 2)
@@ -667,24 +674,41 @@ def run_audit(target: str) -> None:
     print(f"  {title}")
     print(f"╚{border}╝")
 
-    check_open_ports(target)
-    check_ssh_algorithms(target)
-    check_ssh_banner(target)
-    check_ssh_root_login(target)
-    check_ssh_password_auth(target)
-    check_tls_versions(target)
-    check_tls_certificate(target)
-    check_http_security(target)
+    if all_groups or "ports" in only:
+        check_open_ports(target)
+    if all_groups or "ssh" in only:
+        check_ssh_algorithms(target)
+        check_ssh_banner(target)
+        check_ssh_root_login(target)
+        check_ssh_password_auth(target)
+    if all_groups or "tls" in only:
+        check_tls_versions(target)
+        check_tls_certificate(target)
+    if all_groups or "http" in only:
+        check_http_security(target)
 
-    total = _counts["pass"] + _counts["fail"]
+    c = _counts()
+    total = c["pass"] + c["fail"]
     print(f"\n╔{border}╗")
     print(f"  Summary — {total} checks")
-    print(f"  [PASS] {_counts['pass']}   [FAIL] {_counts['fail']}")
-    if _counts["fail"] == 0:
+    print(f"  [PASS] {c['pass']}   [FAIL] {c['fail']}")
+    if c["fail"] == 0:
         print("  All checks passed.")
     else:
-        print(f"  {_counts['fail']} issue(s) require attention.")
+        print(f"  {c['fail']} issue(s) require attention.")
     print(f"╚{border}╝")
+
+
+def run_audit_buffered(target: str, only: set[str] | None) -> str:
+    """Run run_audit() with stdout captured to a string and return it.
+
+    Used by parallel scanning so that each host's output is collected
+    complete and then printed in submission order, avoiding interleaved lines.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_audit(target, only)
+    return buf.getvalue()
 
 
 # ── Multi-host summary ─────────────────────────────────────────────────────────
@@ -692,7 +716,10 @@ def run_audit(target: str) -> None:
 def print_multi_summary(targets: list[str]) -> None:
     """Print a condensed per-host table after scanning multiple targets."""
     host_counts: dict[str, dict[str, int]] = {}
-    for row in _results:
+    with _results_lock:
+        snapshot = list(_results)
+
+    for row in snapshot:
         h = row["host"]
         if h not in host_counts:
             host_counts[h] = {"pass": 0, "fail": 0}
@@ -704,7 +731,7 @@ def print_multi_summary(targets: list[str]) -> None:
     col_width = max(len(h) for h in targets) + 2
     border = "═" * (col_width + 26)
     print(f"\n╔{border}╗")
-    print(f"  {'Multi-host summary'}")
+    print("  Multi-host summary")
     print(f"  {'Host':<{col_width}} {'PASS':>6}  {'FAIL':>6}  {'Total':>6}")
     print(f"  {'─' * (col_width + 24)}")
     for h in targets:
@@ -723,7 +750,8 @@ def main() -> None:
             "Examples:\n"
             "  auditor.py example.com\n"
             "  auditor.py host1 host2 host3 --csv results.csv\n"
-            "  auditor.py -f hosts.txt --csv results.csv"
+            "  auditor.py -f hosts.txt --parallel --timeout 10\n"
+            "  auditor.py example.com --only ssh tls"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -743,10 +771,34 @@ def main() -> None:
         metavar="FILE",
         help="write results to a CSV file after all audits complete",
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=5,
+        metavar="SECONDS",
+        help="connection timeout in seconds (default: 5)",
+    )
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        choices=list(CHECK_GROUPS),
+        metavar="GROUP",
+        help=f"run only the specified check group(s): {', '.join(CHECK_GROUPS)}",
+    )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="scan multiple targets in parallel (default: sequential)",
+    )
     args = parser.parse_args()
 
-    targets: list[str] = list(args.targets)
+    # Apply timeout globally before any checks run.
+    global _timeout
+    _timeout = args.timeout
 
+    only: set[str] | None = set(args.only) if args.only else None
+
+    targets: list[str] = list(args.targets)
     if args.file:
         try:
             with open(args.file, encoding="utf-8") as fh:
@@ -762,8 +814,18 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    for target in targets:
-        run_audit(target)
+    if args.parallel and len(targets) > 1:
+        # Each target runs in its own thread with stdout buffered.
+        # Futures are submitted in order and printed in order so the output
+        # is deterministic regardless of which thread finishes first.
+        max_workers = min(len(targets), 20)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run_audit_buffered, t, only) for t in targets]
+            for future in futures:
+                print(future.result(), end="")
+    else:
+        for target in targets:
+            run_audit(target, only)
 
     if len(targets) > 1:
         print_multi_summary(targets)
