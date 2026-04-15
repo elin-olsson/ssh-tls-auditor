@@ -47,6 +47,12 @@ python3 auditor.py -f hosts.txt
 python3 auditor.py example.com --csv report.csv
 python3 auditor.py -f hosts.txt --csv report.csv
 
+# Save results to HTML report
+python3 auditor.py example.com --html report.html
+
+# Save results to JSON
+python3 auditor.py example.com --json report.json
+
 # Scan multiple targets in parallel
 python3 auditor.py -f hosts.txt --parallel
 
@@ -64,7 +70,7 @@ python3 auditor.py -f hosts.txt --parallel --timeout 3
 | Group | Checks included |
 |---|---|
 | `ports` | Port 22, 80, 443 |
-| `ssh` | SSH algorithms, banner/version, root login, password auth, legacy detection |
+| `ssh` | SSH algorithms, banner/version, host key type, root login, password auth, legacy detection |
 | `tls` | TLS versions, certificate trust/expiry/hostname |
 | `http` | HTTP → HTTPS redirect, HSTS header |
 
@@ -86,6 +92,7 @@ scanme.nmap.org
 | Open ports | TCP connect to 22, 80, 443 | Port responds |
 | SSH algorithms | Captures server KEXINIT via paramiko | No deprecated algorithms present |
 | SSH banner / version | Reads `transport.remote_version` | OpenSSH ≥ 8.0 (or non-OpenSSH) |
+| SSH host key type | Reads host key via paramiko | ED25519 / ECDSA / RSA ≥ 3072-bit |
 | SSH root login | `auth_none("root")` probe via paramiko | Server rejects root outright |
 | SSH password auth | `auth_password` probe with fake credentials | Server rejects password method |
 | SSH legacy detection | Banner + algorithm fingerprint against device DB | No known legacy device fingerprint |
@@ -103,6 +110,8 @@ scanme.nmap.org
 **Root login check** — sends a `none`-type auth request for user `root`. If the server responds with a list of accepted auth methods, root login is enabled (`[FAIL]`). If it rejects the request outright, root login is likely disabled (`[PASS]`).
 
 > **Note:** This check can produce a false positive on servers that only accept public key authentication for root (e.g. GitHub). The server responds with `publickey` as an accepted method, which triggers `[FAIL]` — but without a valid key, root access is still not possible. The result should be interpreted in context.
+
+**SSH host key check** — reads the server's host key type and size. ED25519 and ECDSA keys are always `[PASS]`. RSA keys are checked against the NIST-recommended minimum of 3072 bits — smaller keys are `[FAIL]`. DSA keys are always `[FAIL]` (fixed 1024-bit, deprecated since OpenSSH 7.0).
 
 **SSH password auth check** — sends an `auth_password` request with obviously fake credentials. If the server rejects the password method entirely (`BadAuthenticationType`), password authentication is disabled (`[PASS]`). If it rejects the credentials but accepts the method, password authentication is enabled (`[FAIL]`) and the server is susceptible to brute-force and credential stuffing attacks.
 
@@ -151,6 +160,9 @@ Running against github.com:
 [SSH Banner]
   [INFO]  SSH server version — SSH-2.0-3992d52
 
+[SSH Host Keys]
+  [PASS]  Host key type — ED25519 — recommended
+
 [SSH Root Login]
   [FAIL]  Root login — enabled — server offered auth methods: publickey
 
@@ -173,9 +185,12 @@ Running against github.com:
   [PASS]  HSTS header — max-age=365 days, includeSubDomains
 
 ╔══════════════════════════════════════╗
-  Summary — 33 checks
-  [PASS] 32   [FAIL] 1
+  Summary — 34 checks
+  [PASS] 33   [FAIL] 1
   1 issue(s) require attention.
+
+  Recommended actions:
+  • Root login: Set PermitRootLogin no in /etc/ssh/sshd_config and run: sudo systemctl reload sshd
 ╚══════════════════════════════════════╝
 ```
 
@@ -192,6 +207,7 @@ Results from two real targets — a well-hardened server and a deliberately misc
 | SSH ciphers | All PASS | 8 FAIL (arcfour, 3des-cbc, blowfish, etc.) |
 | SSH MACs | All PASS | 4 FAIL (hmac-md5, hmac-sha1, etc.) |
 | SSH banner | INFO — custom banner | FAIL — OpenSSH 6.6.1 (< 8.0) |
+| SSH host key | PASS — ED25519 | PASS — ED25519 |
 | SSH root login | FAIL — publickey¹ | FAIL — publickey + password |
 | SSH password auth | PASS — disabled | FAIL — enabled |
 | TLS 1.0 | PASS — disabled | INFO — port 443 closed |
@@ -228,14 +244,43 @@ When scanning more than one target a summary table is printed after all audits:
 Use `--csv <file>` to save all results to a CSV file. Each row is one check:
 
 ```
-host,category,check,result,detail
-github.com,Port Check,Port 22 (SSH),PASS,open
-github.com,SSH Algorithms,curve25519-sha256,PASS,
-github.com,SSH Root Login,Root login,FAIL,enabled — server offered auth methods: publickey
+host,category,check,result,detail,remediation
+github.com,Port Check,Port 22 (SSH),PASS,open,
+github.com,SSH Algorithms,curve25519-sha256,PASS,,
+github.com,SSH Root Login,Root login,FAIL,enabled — server offered auth methods: publickey,Set PermitRootLogin no ...
 ...
 ```
 
 Useful for importing into spreadsheets or filtering with tools like `grep`, `awk`, or pandas.
+
+### HTML report
+
+Use `--html <file>` to generate a self-contained HTML report with colour-coded results and per-failure fix instructions:
+
+```bash
+python3 auditor.py example.com --html report.html
+```
+
+Open `report.html` in any browser — no internet connection required.
+
+### JSON export
+
+Use `--json <file>` for machine-readable output suitable for scripting or integration with other tools:
+
+```bash
+python3 auditor.py example.com --json report.json
+```
+
+Output includes a timestamp and an array of result objects with `host`, `category`, `check`, `result`, `detail`, and `remediation` fields.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | All checks passed |
+| `1` | One or more checks failed |
+
+Useful in CI/CD pipelines: the tool exits with code 1 if any `[FAIL]` result is found.
 
 ## Output legend
 
