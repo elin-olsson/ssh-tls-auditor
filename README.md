@@ -46,7 +46,27 @@ python3 auditor.py -f hosts.txt
 # Save results to CSV
 python3 auditor.py example.com --csv report.csv
 python3 auditor.py -f hosts.txt --csv report.csv
+
+# Scan multiple targets in parallel
+python3 auditor.py -f hosts.txt --parallel
+
+# Run only specific check groups
+python3 auditor.py example.com --only ssh
+python3 auditor.py example.com --only tls http
+
+# Adjust connection timeout (default: 5s)
+python3 auditor.py example.com --timeout 10
+python3 auditor.py -f hosts.txt --parallel --timeout 3
 ```
+
+### Check groups (`--only`)
+
+| Group | Checks included |
+|---|---|
+| `ports` | Port 22, 80, 443 |
+| `ssh` | SSH algorithms, banner/version, root login, password auth |
+| `tls` | TLS versions, certificate trust/expiry/hostname |
+| `http` | HTTP → HTTPS redirect, HSTS header |
 
 ### hosts.txt format
 
