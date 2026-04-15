@@ -67,6 +67,11 @@ scanme.nmap.org
 | SSH algorithms | Captures server KEXINIT via paramiko | No deprecated algorithms present |
 | SSH root login | `auth_none("root")` probe via paramiko | Server rejects root outright |
 | TLS versions | TLS handshake per version via `ssl` | 1.2/1.3 supported, 1.0/1.1 disabled |
+| TLS certificate trust | Full chain verification against system CA bundle | Issued by a trusted CA |
+| TLS certificate expiry | Parsed from `notAfter` field | Valid for > 90 days |
+| TLS hostname match | SAN list (DNS + IP) checked against target | Certificate covers the target |
+| HTTP → HTTPS redirect | GET / on port 80, check for 3xx to https:// | Redirects to HTTPS |
+| HSTS header | HEAD / on port 443, parse `Strict-Transport-Security` | Present, max-age ≥ 180 days |
 
 **SSH algorithm check** — connects to port 22 and reads the full list of algorithms the server advertises in its KEXINIT message (key exchange, ciphers, MACs). Each is marked `[PASS]` if modern or `[FAIL]` if deprecated (e.g. `arcfour`, `3des-cbc`, `hmac-md5`).
 
@@ -112,9 +117,18 @@ Running against github.com:
   [PASS]  TLS 1.2 — supported
   [PASS]  TLS 1.3 — supported
 
+[TLS Certificate]
+  [PASS]  Certificate trust — issued by Sectigo Limited
+  [INFO]  Certificate expiry — expires in 49 day(s) (2026-06-03) — renewal recommended soon
+  [PASS]  Hostname match — certificate covers github.com
+
+[HTTP Security]
+  [PASS]  HTTP → HTTPS redirect — HTTP 301 → https://github.com/
+  [PASS]  HSTS header — max-age=365 days, includeSubDomains
+
 ╔══════════════════════════════════════╗
-  Summary — 27 checks
-  [PASS] 26   [FAIL] 1
+  Summary — 31 checks
+  [PASS] 30   [FAIL] 1
   1 issue(s) require attention.
 ╚══════════════════════════════════════╝
 ```
@@ -136,7 +150,12 @@ Results from two real targets — a well-hardened server and a deliberately misc
 | TLS 1.1 | PASS — disabled | INFO — port 443 closed |
 | TLS 1.2 | PASS — supported | INFO — port 443 closed |
 | TLS 1.3 | PASS — supported | INFO — port 443 closed |
-| **Total FAIL** | **1** | **18** |
+| Certificate trust | PASS — Sectigo Limited | INFO — port 443 closed |
+| Certificate expiry | INFO — expires soon | INFO — port 443 closed |
+| Hostname match | PASS | INFO — port 443 closed |
+| HTTP → HTTPS redirect | PASS — 301 | FAIL — no redirect (HTTP 200) |
+| HSTS header | PASS — 365 days | INFO — port 443 closed |
+| **Total FAIL** | **1** | **19** |
 
 ¹ See root login note above — github.com requires a valid key, so this is a false positive in practice.
 

@@ -16,6 +16,9 @@ Usage:
 
 import argparse
 import csv
+import datetime
+import http.client
+import ipaddress
 import socket
 import ssl
 import sys
@@ -288,6 +291,243 @@ def check_tls_versions(target: str) -> None:
             info(label, f"could not reach port 443 — {e}")
 
 
+# ── TLS certificate helpers ────────────────────────────────────────────────────
+
+def _hostname_matches(target: str, names: list[str]) -> bool:
+    """Return True if target matches any name in the list.
+
+    Handles exact matches and single-label wildcards (*.example.com).
+    Wildcard matching follows RFC 6125: the wildcard covers exactly one label
+    and only in the leftmost position.
+    """
+    target = target.lower()
+    for name in names:
+        name = name.lower()
+        if name == target:
+            return True
+        if name.startswith("*."):
+            suffix = name[1:]           # ".example.com"
+            rest = target[: -len(suffix)]
+            if target.endswith(suffix) and "." not in rest:
+                return True
+    return False
+
+
+def _is_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+# ── New checks ─────────────────────────────────────────────────────────────────
+
+def check_tls_certificate(target: str) -> None:
+    """Retrieve the TLS certificate from port 443 and check:
+
+      - Expiry date (FAIL if expired or < 30 days, INFO if < 90 days)
+      - Self-signed (issuer == subject is a FAIL for public-facing servers)
+      - Hostname match (cert must cover the target hostname/IP via SANs or CN)
+    """
+    global _current_category
+    _current_category = "TLS Certificate"
+    print("\n[TLS Certificate]")
+
+    # create_default_context() loads the system CA bundle and sets
+    # CERT_REQUIRED by default, which makes getpeercert() return the full
+    # parsed certificate dict on success.
+    #
+    # We disable check_hostname here and perform the hostname check ourselves
+    # against the SAN list — this produces a more informative error message
+    # than OpenSSL's generic one, and lets trust and hostname be separate
+    # findings.
+    #
+    # SSLCertVerificationError is raised for any chain problem (self-signed,
+    # expired, unknown CA, revoked). We extract a readable reason from the
+    # error string and report it as a single FAIL, then return — without a
+    # trusted cert dict, expiry and hostname checks cannot run.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+
+    cert = None
+    try:
+        with socket.create_connection((target, 443), timeout=5) as raw:
+            with ctx.wrap_socket(raw, server_hostname=target) as ssock:
+                cert = ssock.getpeercert()
+    except ssl.SSLCertVerificationError as e:
+        # Extract the human-readable reason from the OpenSSL error string:
+        # "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: <reason> (_ssl.c:NNN)"
+        msg = str(e)
+        if "certificate verify failed:" in msg:
+            reason = msg.split("certificate verify failed:")[1].split("(")[0].strip()
+        else:
+            reason = msg
+        failed("Certificate trust", reason)
+        return
+    except ssl.SSLError as e:
+        info("TLS Certificate", f"TLS error — {e}")
+        return
+    except ConnectionRefusedError:
+        info("TLS Certificate", "port 443 closed — skipping")
+        return
+    except (socket.timeout, OSError) as e:
+        info("TLS Certificate", f"could not reach port 443 — {e}")
+        return
+
+    if not cert:
+        info("TLS Certificate", "no certificate data returned")
+        return
+
+    # ── Trust ────────────────────────────────────────────────────────────────────
+    # Reaching here means CERT_REQUIRED passed — the cert is signed by a
+    # trusted CA and the chain is valid.
+    issuer = dict(x[0] for x in cert.get("issuer", []))
+    issuer_name = issuer.get("organizationName") or issuer.get("commonName", "unknown")
+    passed("Certificate trust", f"issued by {issuer_name}")
+
+    # ── Expiry ──────────────────────────────────────────────────────────────────
+    try:
+        not_after = datetime.datetime.strptime(
+            cert["notAfter"], "%b %d %H:%M:%S %Y %Z"
+        ).replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        days_left = (not_after - now).days
+
+        if days_left < 0:
+            failed("Certificate expiry",
+                   f"expired {abs(days_left)} day(s) ago ({not_after.date()})")
+        elif days_left < 30:
+            failed("Certificate expiry",
+                   f"expires in {days_left} day(s) ({not_after.date()}) — renew immediately")
+        elif days_left < 90:
+            info("Certificate expiry",
+                 f"expires in {days_left} day(s) ({not_after.date()}) — renewal recommended soon")
+        else:
+            passed("Certificate expiry",
+                   f"valid for {days_left} more day(s) (expires {not_after.date()})")
+    except (KeyError, ValueError):
+        info("Certificate expiry", "could not parse expiry date")
+
+    # ── Hostname match ──────────────────────────────────────────────────────────
+    if _is_ip(target):
+        # For IP addresses, check the IP SAN list
+        ip_sans = [addr for kind, addr in cert.get("subjectAltName", [])
+                   if kind == "IP Address"]
+        if target in ip_sans:
+            passed("Hostname match", f"certificate covers IP {target}")
+        elif ip_sans:
+            failed("Hostname match",
+                   f"certificate does not cover {target} — IP SANs: {', '.join(ip_sans)}")
+        else:
+            failed("Hostname match",
+                   f"certificate has no IP SANs — does not cover {target}")
+    else:
+        dns_sans = [name for kind, name in cert.get("subjectAltName", [])
+                    if kind == "DNS"]
+        if dns_sans:
+            if _hostname_matches(target, dns_sans):
+                passed("Hostname match", f"certificate covers {target}")
+            else:
+                preview = ", ".join(dns_sans[:4])
+                if len(dns_sans) > 4:
+                    preview += f" (+{len(dns_sans) - 4} more)"
+                failed("Hostname match",
+                       f"certificate does not cover {target} — SANs: {preview}")
+        else:
+            # Fall back to CN (legacy, no SANs present)
+            cn = subject.get("commonName", "")
+            if cn and _hostname_matches(target, [cn]):
+                passed("Hostname match", f"certificate CN matches {target}")
+            else:
+                failed("Hostname match",
+                       f"certificate CN '{cn}' does not match {target}")
+
+
+def check_http_security(target: str) -> None:
+    """Check HTTP→HTTPS redirect behaviour and HSTS header on port 443.
+
+    HTTP redirect — a GET to port 80 should return a 3xx redirect to an
+    https:// URL. Anything else (200, redirect to http, no redirect) is a FAIL.
+
+    HSTS — the Strict-Transport-Security header must be present on the HTTPS
+    response. max-age should be at least 180 days (15 552 000 seconds); shorter
+    values give browsers too small a window to remember to use HTTPS.
+    """
+    global _current_category
+    _current_category = "HTTP Security"
+    print("\n[HTTP Security]")
+
+    # ── HTTP → HTTPS redirect ───────────────────────────────────────────────────
+    try:
+        conn = http.client.HTTPConnection(target, 80, timeout=5)
+        conn.request("GET", "/", headers={"Host": target,
+                                          "User-Agent": "ssh-tls-auditor"})
+        resp = conn.getresponse()
+        location = resp.getheader("Location", "")
+        if resp.status in (301, 302, 303, 307, 308) and location.lower().startswith("https://"):
+            passed("HTTP → HTTPS redirect", f"HTTP {resp.status} → {location}")
+        elif resp.status in (301, 302, 303, 307, 308):
+            failed("HTTP → HTTPS redirect",
+                   f"redirects to non-HTTPS location: {location or '(empty)'}")
+        else:
+            failed("HTTP → HTTPS redirect",
+                   f"no redirect — server returned HTTP {resp.status} on port 80")
+        conn.close()
+    except ConnectionRefusedError:
+        info("HTTP → HTTPS redirect", "port 80 closed — skipping")
+    except (socket.timeout, OSError) as e:
+        info("HTTP → HTTPS redirect", f"could not reach port 80 — {e}")
+
+    # ── HSTS ────────────────────────────────────────────────────────────────────
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        conn = http.client.HTTPSConnection(target, 443, timeout=5, context=ctx)
+        conn.request("HEAD", "/", headers={"Host": target,
+                                           "User-Agent": "ssh-tls-auditor"})
+        resp = conn.getresponse()
+        hsts = resp.getheader("Strict-Transport-Security", "")
+        conn.close()
+
+        if not hsts:
+            failed("HSTS header", "Strict-Transport-Security not present")
+            return
+
+        # Parse max-age value
+        max_age: int | None = None
+        for part in hsts.split(";"):
+            part = part.strip()
+            if part.lower().startswith("max-age="):
+                try:
+                    max_age = int(part.split("=", 1)[1])
+                except ValueError:
+                    pass
+
+        include_subdomains = "includesubdomains" in hsts.lower()
+        MIN_MAX_AGE = 15_552_000  # 180 days in seconds
+
+        if max_age is None:
+            failed("HSTS header", f"present but max-age could not be parsed: {hsts}")
+        elif max_age < MIN_MAX_AGE:
+            days = max_age // 86400
+            failed("HSTS header",
+                   f"max-age too short — {days} day(s) (minimum recommended: 180 days)")
+        else:
+            days = max_age // 86400
+            detail = f"max-age={days} days"
+            if include_subdomains:
+                detail += ", includeSubDomains"
+            passed("HSTS header", detail)
+
+    except ConnectionRefusedError:
+        info("HSTS header", "port 443 closed — skipping")
+    except (socket.timeout, OSError, ssl.SSLError) as e:
+        info("HSTS header", f"could not reach port 443 — {e}")
+
+
 # ── CSV export ─────────────────────────────────────────────────────────────────
 
 def write_csv(path: str) -> None:
@@ -318,6 +558,8 @@ def run_audit(target: str) -> None:
     check_ssh_algorithms(target)
     check_ssh_root_login(target)
     check_tls_versions(target)
+    check_tls_certificate(target)
+    check_http_security(target)
 
     total = _counts["pass"] + _counts["fail"]
     print(f"\n╔{border}╗")
