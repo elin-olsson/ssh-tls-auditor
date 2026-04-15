@@ -178,6 +178,119 @@ def check_ssh_algorithms(target: str) -> None:
     evaluate("MACs",         captured.get("macs", []), WEAK_MACS)
 
 
+def check_ssh_banner(target: str) -> None:
+    """Read the SSH server banner and check the OpenSSH version.
+
+    The server version string (e.g. SSH-2.0-OpenSSH_9.2p1 Ubuntu-2ubuntu0.1)
+    is sent in cleartext before authentication. It is always shown as [INFO]
+    so the user has context regardless of the outcome.
+
+    For OpenSSH, the version number is parsed and compared against a minimum:
+      < 8.0 — [FAIL]: pre-2019 release, likely missing security fixes
+      >= 8.0 — [PASS]: current enough for most environments
+
+    Note: Linux distros sometimes backport security patches without bumping
+    the upstream version number, so a low version does not always mean
+    unpatched. Treat the result as a prompt to verify, not a definitive verdict.
+
+    Non-OpenSSH implementations (Dropbear, libssh, etc.) are reported as
+    [INFO] — no version threshold is applied since their release cycles differ.
+    """
+    global _current_category
+    _current_category = "SSH Banner"
+    print("\n[SSH Banner]")
+
+    transport = None
+    try:
+        transport = paramiko.Transport((target, 22))
+        transport.start_client(timeout=5)
+        banner = transport.remote_version or ""
+    except Exception as e:
+        info("SSH server version", f"could not connect — {e}")
+        return
+    finally:
+        if transport:
+            transport.close()
+
+    if not banner:
+        info("SSH server version", "no banner received")
+        return
+
+    info("SSH server version", banner)
+
+    if "OpenSSH_" not in banner:
+        # Dropbear, libssh, etc. — no version threshold applied
+        return
+
+    try:
+        # Banner format: SSH-2.0-OpenSSH_9.2p1[ distro-info]
+        raw = banner.split("OpenSSH_")[1].split()[0]   # "9.2p1"
+        numeric = raw.split("p")[0]                     # "9.2"
+        parts = numeric.split(".")
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except (IndexError, ValueError):
+        info("OpenSSH version", "could not parse version number")
+        return
+
+    if major < 8:
+        failed("OpenSSH version",
+               f"{raw} — outdated (< 8.0), upgrade recommended")
+    else:
+        passed("OpenSSH version", f"{raw} — current")
+
+
+def check_ssh_password_auth(target: str) -> None:
+    """Probe whether password authentication is enabled on port 22.
+
+    Sends an auth_password request using an obviously fake username and
+    password. Two outcomes are possible:
+
+      BadAuthenticationType — the server rejected the password method outright
+          and replied with a list of accepted methods (e.g. publickey only).
+          Password authentication is disabled. [PASS]
+
+      AuthenticationException (not BadAuthenticationType) — the server
+          accepted the password method but rejected the credentials as wrong.
+          Password authentication is enabled. [FAIL]
+
+    Password authentication should be disabled on hardened servers. Key-based
+    auth is strictly stronger and immune to brute-force and credential stuffing.
+
+    Note: BadAuthenticationType is a subclass of AuthenticationException, so
+    it must be caught first.
+    """
+    global _current_category
+    _current_category = "SSH Password Auth"
+    print("\n[SSH Password Auth]")
+
+    transport = None
+    try:
+        transport = paramiko.Transport((target, 22))
+        transport.start_client(timeout=5)
+        transport.auth_password("__audit_probe__", "__audit_wrong_pw_12345__")
+        # auth_password succeeded — highly unexpected, but report it
+        failed("Password authentication",
+               "enabled — probe credentials unexpectedly authenticated")
+
+    except paramiko.BadAuthenticationType:
+        # Server does not accept password auth at all
+        passed("Password authentication",
+               "disabled — server does not accept password authentication")
+
+    except paramiko.AuthenticationException:
+        # Server accepted the method, rejected credentials → password auth is on
+        failed("Password authentication",
+               "enabled — server accepts password authentication")
+
+    except Exception as e:
+        info("Password authentication", f"could not determine — {e}")
+
+    finally:
+        if transport:
+            transport.close()
+
+
 def check_ssh_root_login(target: str) -> None:
     """Probe whether root login is enabled by sending a 'none' auth request.
 
@@ -556,7 +669,9 @@ def run_audit(target: str) -> None:
 
     check_open_ports(target)
     check_ssh_algorithms(target)
+    check_ssh_banner(target)
     check_ssh_root_login(target)
+    check_ssh_password_auth(target)
     check_tls_versions(target)
     check_tls_certificate(target)
     check_http_security(target)
