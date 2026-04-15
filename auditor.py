@@ -17,6 +17,8 @@ Usage:
     python3 auditor.py <target> [<target> ...]
     python3 auditor.py -f hosts.txt
     python3 auditor.py example.com 192.168.1.10 --csv report.csv
+    python3 auditor.py example.com --html report.html
+    python3 auditor.py example.com --json report.json
     python3 auditor.py -f hosts.txt --parallel --timeout 10
     python3 auditor.py example.com --only ssh tls
 """
@@ -25,9 +27,11 @@ import argparse
 import concurrent.futures
 import csv
 import datetime
+import html as html_module
 import http.client
 import io
 import ipaddress
+import json
 import socket
 import ssl
 import sys
@@ -107,14 +111,15 @@ _results_lock = threading.Lock()
 
 # ── Result helpers ─────────────────────────────────────────────────────────────
 
-def _record(result: str, label: str, detail: str) -> None:
+def _record(result: str, label: str, detail: str, remediation: str = "") -> None:
     with _results_lock:
         _results.append({
-            "host":     _host(),
-            "category": _category(),
-            "check":    label,
-            "result":   result,
-            "detail":   detail,
+            "host":        _host(),
+            "category":    _category(),
+            "check":       label,
+            "result":      result,
+            "detail":      detail,
+            "remediation": remediation,
         })
 
 
@@ -127,9 +132,9 @@ def passed(label: str, detail: str = "") -> None:
     print(line)
 
 
-def failed(label: str, detail: str = "") -> None:
+def failed(label: str, detail: str = "", remediation: str = "") -> None:
     _counts()["fail"] += 1
-    _record("FAIL", label, detail)
+    _record("FAIL", label, detail, remediation)
     line = f"  [FAIL]  {label}"
     if detail:
         line += f" — {detail}"
@@ -160,7 +165,8 @@ def info(label: str, detail: str = "") -> None:
 #                    Medium confidence.
 #
 # insecure_kex / insecure_ciphers — subsets of algorithms from this device that
-# should be flagged as [FAIL] when present and have no modern counterpart.
+# should be flagged as [FAIL] when present and have no modern counterpart in the
+# same category.
 
 _LEGACY_FINGERPRINTS: list[dict] = [
     # ── Banner-matched (high confidence) ───────────────────────────────────────
@@ -366,6 +372,11 @@ def check_open_ports(target: str) -> None:
     print("\n[Port Check]")
 
     ports = {22: "SSH", 80: "HTTP", 443: "HTTPS"}
+    remediations = {
+        22:  "Ensure sshd is running: sudo systemctl start sshd",
+        80:  "Start your web server and open port 80 in the firewall.",
+        443: "Configure TLS on your web server and open port 443 in the firewall.",
+    }
     for port, label in ports.items():
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -375,7 +386,7 @@ def check_open_ports(target: str) -> None:
             if result == 0:
                 passed(f"Port {port} ({label})", "open")
             else:
-                failed(f"Port {port} ({label})", "closed")
+                failed(f"Port {port} ({label})", "closed", remediations[port])
         except socket.gaierror:
             failed(f"Port {port} ({label})", "could not resolve host")
         except socket.timeout:
@@ -414,17 +425,21 @@ def check_ssh_algorithms(target: str) -> None:
         failed("Could not retrieve algorithm list from server")
         return
 
-    def evaluate(label: str, algos: list, weak_set: set) -> None:
+    def evaluate(label: str, algos: list, weak_set: set, config_key: str) -> None:
         print(f"  {label}:")
         for algo in algos:
             if algo in weak_set:
-                failed(algo, "deprecated")
+                failed(
+                    algo,
+                    "deprecated",
+                    f"Remove '{algo}' from {config_key} in sshd_config and reload sshd.",
+                )
             else:
                 passed(algo)
 
-    evaluate("Key exchange", captured.get("kex", []), WEAK_KEX)
-    evaluate("Ciphers",      captured.get("ciphers", []), WEAK_CIPHERS)
-    evaluate("MACs",         captured.get("macs", []), WEAK_MACS)
+    evaluate("Key exchange", captured.get("kex", []),     WEAK_KEX,     "KexAlgorithms")
+    evaluate("Ciphers",      captured.get("ciphers", []), WEAK_CIPHERS, "Ciphers")
+    evaluate("MACs",         captured.get("macs", []),    WEAK_MACS,    "MACs")
 
 
 def check_ssh_banner(target: str) -> None:
@@ -468,7 +483,11 @@ def check_ssh_banner(target: str) -> None:
         return
 
     if major < 8:
-        failed("OpenSSH version", f"{raw} — outdated (< 8.0), upgrade recommended")
+        failed(
+            "OpenSSH version",
+            f"{raw} — outdated (< 8.0), upgrade recommended",
+            "Upgrade OpenSSH: sudo apt upgrade openssh-server  or  sudo dnf upgrade openssh-server",
+        )
     else:
         passed("OpenSSH version", f"{raw} — current")
 
@@ -496,11 +515,19 @@ def check_ssh_root_login(target: str) -> None:
         transport = paramiko.Transport((target, 22))
         transport.start_client(timeout=_timeout)
         transport.auth_none("root")
-        failed("Root login", "enabled — authenticated as root with no credentials")
+        failed(
+            "Root login",
+            "enabled — authenticated as root with no credentials",
+            "Set PermitRootLogin no in /etc/ssh/sshd_config and run: sudo systemctl reload sshd",
+        )
 
     except paramiko.BadAuthenticationType as e:
         methods = ", ".join(e.allowed_types) if e.allowed_types else "unknown"
-        failed("Root login", f"enabled — server offered auth methods: {methods}")
+        failed(
+            "Root login",
+            f"enabled — server offered auth methods: {methods}",
+            "Set PermitRootLogin no in /etc/ssh/sshd_config and run: sudo systemctl reload sshd",
+        )
 
     except paramiko.AuthenticationException:
         passed("Root login", "disabled — server rejected auth for root")
@@ -532,16 +559,25 @@ def check_ssh_password_auth(target: str) -> None:
         transport = paramiko.Transport((target, 22))
         transport.start_client(timeout=_timeout)
         transport.auth_password("__audit_probe__", "__audit_wrong_pw_12345__")
-        failed("Password authentication",
-               "enabled — probe credentials unexpectedly authenticated")
+        failed(
+            "Password authentication",
+            "enabled — probe credentials unexpectedly authenticated",
+            "Set PasswordAuthentication no in sshd_config. Ensure key-based auth works first.",
+        )
 
     except paramiko.BadAuthenticationType:
         passed("Password authentication",
                "disabled — server does not accept password authentication")
 
     except paramiko.AuthenticationException:
-        failed("Password authentication",
-               "enabled — server accepts password authentication")
+        failed(
+            "Password authentication",
+            "enabled — server accepts password authentication",
+            (
+                "Disable password auth: set PasswordAuthentication no in sshd_config. "
+                "Ensure SSH key-based login works first, then: sudo systemctl reload sshd"
+            ),
+        )
 
     except Exception as e:
         info("Password authentication", f"could not determine — {e}")
@@ -593,6 +629,12 @@ def check_ssh_legacy(target: str) -> None:
     # ── Device identification ──────────────────────────────────────────────────
     fp, method = _match_fingerprint(banner, kex, ciphers)
 
+    legacy_remediation = (
+        "Upgrade device firmware if available. If SSH cannot be secured, "
+        "use an alternative management protocol (HTTPS/RIBCL) and isolate "
+        "the device on a dedicated management VLAN."
+    )
+
     if fp:
         confidence = "identified by banner" if method == "banner" else "identified by algorithm fingerprint"
         info("Device fingerprint", f"{fp['name']} ({confidence})")
@@ -600,30 +642,42 @@ def check_ssh_legacy(target: str) -> None:
 
         # Flag insecure algorithms specific to this device that are present
         # and have no modern counterpart in the same category.
-        legacy_kex_present    = fp["insecure_kex"]    & kex_set
+        legacy_kex_present     = fp["insecure_kex"]     & kex_set
         legacy_ciphers_present = fp["insecure_ciphers"] & cph_set
-        has_modern_kex    = bool(_MODERN_KEX & kex_set)
-        has_modern_ciphers = bool(cph_set - _LEGACY_CIPHERS)
+        has_modern_kex         = bool(_MODERN_KEX & kex_set)
+        has_modern_ciphers     = bool(cph_set - _LEGACY_CIPHERS)
 
         if legacy_kex_present and not has_modern_kex:
-            failed("Legacy KEX only",
-                   f"device supports only: {', '.join(sorted(legacy_kex_present))}")
+            failed(
+                "Legacy KEX only",
+                f"device supports only: {', '.join(sorted(legacy_kex_present))}",
+                legacy_remediation,
+            )
         if legacy_ciphers_present and not has_modern_ciphers:
-            failed("Legacy ciphers only",
-                   f"device supports only: {', '.join(sorted(legacy_ciphers_present))}")
+            failed(
+                "Legacy ciphers only",
+                f"device supports only: {', '.join(sorted(legacy_ciphers_present))}",
+                legacy_remediation,
+            )
     else:
         # ── Standalone legacy checks (no specific device match) ────────────────
-        has_legacy_kex    = bool(_LEGACY_KEX & kex_set)
-        has_modern_kex    = bool(_MODERN_KEX & kex_set)
+        has_legacy_kex     = bool(_LEGACY_KEX & kex_set)
+        has_modern_kex     = bool(_MODERN_KEX & kex_set)
         has_modern_ciphers = bool(cph_set - _LEGACY_CIPHERS)
 
         if has_legacy_kex and not has_modern_kex:
             legacy_present = sorted(_LEGACY_KEX & kex_set)
-            failed("No modern key exchange available",
-                   f"only deprecated KEX advertised: {', '.join(legacy_present)}")
+            failed(
+                "No modern key exchange available",
+                f"only deprecated KEX advertised: {', '.join(legacy_present)}",
+                legacy_remediation,
+            )
         if ciphers and not has_modern_ciphers:
-            failed("No modern ciphers available",
-                   "only deprecated cipher modes (CBC/RC4) advertised")
+            failed(
+                "No modern ciphers available",
+                "only deprecated cipher modes (CBC/RC4) advertised",
+                legacy_remediation,
+            )
 
         if not (has_legacy_kex and not has_modern_kex) and not (ciphers and not has_modern_ciphers):
             passed("Legacy detection", "no known legacy device fingerprint detected")
@@ -639,6 +693,12 @@ def check_tls_versions(target: str) -> None:
     """
     _thread_local.category = "TLS Version Support"
     print("\n[TLS Version Support]")
+
+    tls_legacy_remediation = (
+        "Disable TLS 1.0 and 1.1 in your web server config. "
+        "Nginx: ssl_protocols TLSv1.2 TLSv1.3;  "
+        "Apache: SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1"
+    )
 
     versions = [
         (getattr(ssl.TLSVersion, "TLSv1",   None), "TLS 1.0", False),
@@ -670,7 +730,7 @@ def check_tls_versions(target: str) -> None:
                     if should_succeed:
                         passed(label, "supported")
                     else:
-                        failed(label, "supported — should be disabled")
+                        failed(label, "supported — should be disabled", tls_legacy_remediation)
         except ssl.SSLError:
             if should_succeed:
                 info(label, "not supported by server")
@@ -704,7 +764,11 @@ def check_tls_certificate(target: str) -> None:
             reason = msg.split("certificate verify failed:")[1].split("(")[0].strip()
         else:
             reason = msg
-        failed("Certificate trust", reason)
+        failed(
+            "Certificate trust",
+            reason,
+            "Ensure the full certificate chain is installed and the cert is issued by a trusted CA.",
+        )
         return
     except ssl.SSLError as e:
         info("TLS Certificate", f"TLS error — {e}")
@@ -732,11 +796,17 @@ def check_tls_certificate(target: str) -> None:
         days_left = (not_after - now).days
 
         if days_left < 0:
-            failed("Certificate expiry",
-                   f"expired {abs(days_left)} day(s) ago ({not_after.date()})")
+            failed(
+                "Certificate expiry",
+                f"expired {abs(days_left)} day(s) ago ({not_after.date()})",
+                "Renew the certificate immediately. certbot: sudo certbot renew --force-renewal",
+            )
         elif days_left < 30:
-            failed("Certificate expiry",
-                   f"expires in {days_left} day(s) ({not_after.date()}) — renew immediately")
+            failed(
+                "Certificate expiry",
+                f"expires in {days_left} day(s) ({not_after.date()}) — renew immediately",
+                "Renew the certificate now. certbot: sudo certbot renew",
+            )
         elif days_left < 90:
             info("Certificate expiry",
                  f"expires in {days_left} day(s) ({not_after.date()}) — renewal recommended soon")
@@ -753,11 +823,17 @@ def check_tls_certificate(target: str) -> None:
         if target in ip_sans:
             passed("Hostname match", f"certificate covers IP {target}")
         elif ip_sans:
-            failed("Hostname match",
-                   f"certificate does not cover {target} — IP SANs: {', '.join(ip_sans)}")
+            failed(
+                "Hostname match",
+                f"certificate does not cover {target} — IP SANs: {', '.join(ip_sans)}",
+                f"Reissue the certificate with IP SAN: {target}",
+            )
         else:
-            failed("Hostname match",
-                   f"certificate has no IP SANs — does not cover {target}")
+            failed(
+                "Hostname match",
+                f"certificate has no IP SANs — does not cover {target}",
+                f"Reissue the certificate with IP SAN: {target}",
+            )
     else:
         dns_sans = [name for kind, name in cert.get("subjectAltName", [])
                     if kind == "DNS"]
@@ -768,15 +844,21 @@ def check_tls_certificate(target: str) -> None:
                 preview = ", ".join(dns_sans[:4])
                 if len(dns_sans) > 4:
                     preview += f" (+{len(dns_sans) - 4} more)"
-                failed("Hostname match",
-                       f"certificate does not cover {target} — SANs: {preview}")
+                failed(
+                    "Hostname match",
+                    f"certificate does not cover {target} — SANs: {preview}",
+                    f"Reissue the certificate to include '{target}' in the Subject Alternative Name (SAN) field.",
+                )
         else:
             cn = subject.get("commonName", "")
             if cn and _hostname_matches(target, [cn]):
                 passed("Hostname match", f"certificate CN matches {target}")
             else:
-                failed("Hostname match",
-                       f"certificate CN '{cn}' does not match {target}")
+                failed(
+                    "Hostname match",
+                    f"certificate CN '{cn}' does not match {target}",
+                    f"Reissue the certificate to include '{target}' in the Subject Alternative Name (SAN) field.",
+                )
 
 
 def check_http_security(target: str) -> None:
@@ -793,11 +875,17 @@ def check_http_security(target: str) -> None:
         if resp.status in (301, 302, 303, 307, 308) and location.lower().startswith("https://"):
             passed("HTTP → HTTPS redirect", f"HTTP {resp.status} → {location}")
         elif resp.status in (301, 302, 303, 307, 308):
-            failed("HTTP → HTTPS redirect",
-                   f"redirects to non-HTTPS location: {location or '(empty)'}")
+            failed(
+                "HTTP → HTTPS redirect",
+                f"redirects to non-HTTPS location: {location or '(empty)'}",
+                "Update the redirect to point to https://. Nginx: return 301 https://$host$request_uri;",
+            )
         else:
-            failed("HTTP → HTTPS redirect",
-                   f"no redirect — server returned HTTP {resp.status} on port 80")
+            failed(
+                "HTTP → HTTPS redirect",
+                f"no redirect — server returned HTTP {resp.status} on port 80",
+                "Add HTTP→HTTPS redirect. Nginx: return 301 https://$host$request_uri;  Apache: Redirect permanent / https://example.com/",
+            )
         conn.close()
     except ConnectionRefusedError:
         info("HTTP → HTTPS redirect", "port 80 closed — skipping")
@@ -817,7 +905,11 @@ def check_http_security(target: str) -> None:
         conn.close()
 
         if not hsts:
-            failed("HSTS header", "Strict-Transport-Security not present")
+            failed(
+                "HSTS header",
+                "Strict-Transport-Security not present",
+                "Add HSTS header. Nginx: add_header Strict-Transport-Security 'max-age=15552000; includeSubDomains' always;",
+            )
             return
 
         max_age: int | None = None
@@ -833,11 +925,15 @@ def check_http_security(target: str) -> None:
         MIN_MAX_AGE = 15_552_000  # 180 days
 
         if max_age is None:
-            failed("HSTS header", f"present but max-age could not be parsed: {hsts}")
+            failed("HSTS header", f"present but max-age could not be parsed: {hsts}",
+                   "Fix the Strict-Transport-Security header format: max-age=15552000")
         elif max_age < MIN_MAX_AGE:
             days = max_age // 86400
-            failed("HSTS header",
-                   f"max-age too short — {days} day(s) (minimum recommended: 180 days)")
+            failed(
+                "HSTS header",
+                f"max-age too short — {days} day(s) (minimum recommended: 180 days)",
+                "Increase HSTS max-age to at least 15552000 (180 days).",
+            )
         else:
             days = max_age // 86400
             detail = f"max-age={days} days"
@@ -880,11 +976,157 @@ def _is_ip(s: str) -> bool:
 
 def write_csv(path: str) -> None:
     """Write all collected results to a CSV file."""
-    fieldnames = ["host", "category", "check", "result", "detail"]
+    fieldnames = ["host", "category", "check", "result", "detail", "remediation"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(_results)
+    print(f"Results written to {path}")
+
+
+# ── JSON export ────────────────────────────────────────────────────────────────
+
+def write_json(path: str) -> None:
+    """Write all collected results to a JSON file."""
+    output = {
+        "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "results":   _results,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(output, fh, indent=2)
+    print(f"Results written to {path}")
+
+
+# ── HTML export ────────────────────────────────────────────────────────────────
+
+_HTML_CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px;
+       background: #f4f6f9; color: #222; padding: 24px; }
+h1 { font-size: 24px; color: #1a3a5c; margin-bottom: 4px; }
+.subtitle { color: #555; margin-bottom: 24px; font-size: 13px; }
+h2 { font-size: 18px; color: #1a3a5c; margin: 32px 0 12px; border-bottom: 2px solid #1a3a5c; padding-bottom: 4px; }
+h3 { font-size: 13px; font-weight: 600; color: #333; margin: 20px 0 6px;
+     text-transform: uppercase; letter-spacing: 0.5px; }
+table { width: 100%; border-collapse: collapse; margin-bottom: 16px; background: #fff;
+        border-radius: 6px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+th { background: #1a3a5c; color: #fff; text-align: left; padding: 8px 12px;
+     font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+td { padding: 7px 12px; border-bottom: 1px solid #eee; vertical-align: top; }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: #f9fbfd; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 3px;
+         font-size: 11px; font-weight: 700; letter-spacing: 0.5px; }
+.pass  { background: #e6f4ea; color: #1e7e34; }
+.fail  { background: #fdecea; color: #c0392b; }
+.info  { background: #e8f0fe; color: #1a56b0; }
+.summary-box { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
+.summary-card { background: #fff; border-radius: 6px; padding: 16px 24px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.1); min-width: 140px; text-align: center; }
+.summary-card .number { font-size: 32px; font-weight: 700; }
+.summary-card .label  { font-size: 12px; color: #777; margin-top: 2px; text-transform: uppercase; }
+.num-pass { color: #1e7e34; }
+.num-fail { color: #c0392b; }
+.num-info { color: #1a56b0; }
+.remediation-box { background: #fffbe6; border-left: 4px solid #f0ad00;
+                   border-radius: 4px; padding: 8px 12px; margin-top: 4px;
+                   font-size: 12px; color: #555; }
+.remediation-label { font-weight: 600; color: #b07d00; margin-right: 4px; }
+.host-block { background: #fff; border-radius: 8px; padding: 20px 24px;
+              box-shadow: 0 2px 8px rgba(0,0,0,0.07); margin-bottom: 32px; }
+"""
+
+def write_html(path: str, targets: list[str]) -> None:
+    """Write a self-contained HTML audit report."""
+    e = html_module.escape
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    parts: list[str] = []
+    parts.append(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSH/TLS Audit Report</title>
+<style>{_HTML_CSS}</style>
+</head>
+<body>
+<h1>SSH/TLS Audit Report</h1>
+<p class="subtitle">Generated: {e(now)}</p>
+""")
+
+    # ── Overall summary table ──────────────────────────────────────────────────
+    host_counts: dict[str, dict[str, int]] = {}
+    for row in _results:
+        h = row["host"]
+        if h not in host_counts:
+            host_counts[h] = {"pass": 0, "fail": 0, "info": 0}
+        host_counts[h][row["result"].lower()] += 1
+
+    if len(targets) > 1:
+        parts.append('<h2>Summary</h2>\n')
+        parts.append('<table><thead><tr><th>Host</th><th>PASS</th><th>FAIL</th><th>INFO</th><th>Total</th></tr></thead><tbody>\n')
+        for h in targets:
+            c = host_counts.get(h, {"pass": 0, "fail": 0, "info": 0})
+            total = c["pass"] + c["fail"] + c["info"]
+            parts.append(
+                f'<tr><td>{e(h)}</td>'
+                f'<td><span class="badge pass">{c["pass"]}</span></td>'
+                f'<td><span class="badge fail">{c["fail"]}</span></td>'
+                f'<td><span class="badge info">{c["info"]}</span></td>'
+                f'<td>{total}</td></tr>\n'
+            )
+        parts.append('</tbody></table>\n')
+
+    # ── Per-host sections ──────────────────────────────────────────────────────
+    for target in targets:
+        host_results = [r for r in _results if r["host"] == target]
+        c = host_counts.get(target, {"pass": 0, "fail": 0, "info": 0})
+        total = c["pass"] + c["fail"] + c["info"]
+
+        parts.append(f'<h2>{e(target)}</h2>\n<div class="host-block">\n')
+        parts.append('<div class="summary-box">\n')
+        parts.append(f'<div class="summary-card"><div class="number num-pass">{c["pass"]}</div><div class="label">Pass</div></div>\n')
+        parts.append(f'<div class="summary-card"><div class="number num-fail">{c["fail"]}</div><div class="label">Fail</div></div>\n')
+        parts.append(f'<div class="summary-card"><div class="number num-info">{c["info"]}</div><div class="label">Info</div></div>\n')
+        parts.append(f'<div class="summary-card"><div class="number">{total}</div><div class="label">Total</div></div>\n')
+        parts.append('</div>\n')
+
+        # Group by category
+        categories: dict[str, list[dict]] = {}
+        for row in host_results:
+            cat = row["category"]
+            if cat not in categories:
+                categories[cat] = []
+            categories[cat].append(row)
+
+        for cat, rows in categories.items():
+            parts.append(f'<h3>{e(cat)}</h3>\n')
+            parts.append('<table><thead><tr><th>Check</th><th>Result</th><th>Detail</th></tr></thead><tbody>\n')
+            for row in rows:
+                badge_cls = row["result"].lower()
+                remediation_html = ""
+                if row["result"] == "FAIL" and row.get("remediation"):
+                    remediation_html = (
+                        f'<div class="remediation-box">'
+                        f'<span class="remediation-label">Fix:</span>{e(row["remediation"])}'
+                        f'</div>'
+                    )
+                parts.append(
+                    f'<tr>'
+                    f'<td>{e(row["check"])}</td>'
+                    f'<td><span class="badge {badge_cls}">{e(row["result"])}</span></td>'
+                    f'<td>{e(row["detail"])}{remediation_html}</td>'
+                    f'</tr>\n'
+                )
+            parts.append('</tbody></table>\n')
+
+        parts.append('</div>\n')
+
+    parts.append('</body></html>\n')
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("".join(parts))
     print(f"Results written to {path}")
 
 
@@ -927,6 +1169,25 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         print("  All checks passed.")
     else:
         print(f"  {c['fail']} issue(s) require attention.")
+
+        # Print remediation tips for this host's failures
+        host_fails = [
+            r for r in _results
+            if r["host"] == target and r["result"] == "FAIL" and r.get("remediation")
+        ]
+        if host_fails:
+            # Deduplicate remediation messages
+            seen: set[str] = set()
+            unique_fails = []
+            for r in host_fails:
+                if r["remediation"] not in seen:
+                    seen.add(r["remediation"])
+                    unique_fails.append(r)
+
+            print(f"\n  Recommended actions:")
+            for r in unique_fails:
+                print(f"  • {r['check']}: {r['remediation']}")
+
     print(f"╚{border}╝")
 
 
@@ -984,6 +1245,8 @@ def main() -> None:
             "Examples:\n"
             "  auditor.py example.com\n"
             "  auditor.py host1 host2 host3 --csv results.csv\n"
+            "  auditor.py example.com --html report.html\n"
+            "  auditor.py example.com --json report.json\n"
             "  auditor.py -f hosts.txt --parallel --timeout 10\n"
             "  auditor.py example.com --only ssh tls"
         ),
@@ -1000,6 +1263,14 @@ def main() -> None:
     parser.add_argument(
         "--csv", metavar="FILE",
         help="write results to a CSV file after all audits complete",
+    )
+    parser.add_argument(
+        "--html", metavar="FILE",
+        help="write results to a self-contained HTML report",
+    )
+    parser.add_argument(
+        "--json", metavar="FILE",
+        help="write results to a JSON file",
     )
     parser.add_argument(
         "--timeout", type=int, default=5, metavar="SECONDS",
@@ -1051,6 +1322,16 @@ def main() -> None:
 
     if args.csv:
         write_csv(args.csv)
+
+    if args.html:
+        write_html(args.html, targets)
+
+    if args.json:
+        write_json(args.json)
+
+    # Exit with code 1 if any check failed — useful in CI/CD pipelines
+    has_failures = any(r["result"] == "FAIL" for r in _results)
+    sys.exit(1 if has_failures else 0)
 
 
 if __name__ == "__main__":
