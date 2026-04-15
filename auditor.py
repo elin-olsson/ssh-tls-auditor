@@ -23,7 +23,6 @@ Usage:
 
 import argparse
 import concurrent.futures
-import contextlib
 import csv
 import datetime
 import http.client
@@ -39,6 +38,33 @@ import paramiko
 import paramiko.message
 
 
+# ── Thread-local stdout ────────────────────────────────────────────────────────
+#
+# contextlib.redirect_stdout modifies sys.stdout globally and is not
+# thread-safe. Instead we install a single dispatcher as sys.stdout at import
+# time. When a thread sets _thread_local.output to a StringIO buffer, all
+# print() calls from that thread go to the buffer. Other threads (including
+# the main thread) keep writing to the real stdout unchanged.
+
+class _ThreadLocalStdout:
+    def __init__(self, real: io.TextIOWrapper) -> None:
+        self._real = real
+
+    def write(self, s: str) -> int:
+        buf = getattr(_thread_local, "output", None)
+        return (buf if buf is not None else self._real).write(s)
+
+    def flush(self) -> None:
+        buf = getattr(_thread_local, "output", None)
+        (buf if buf is not None else self._real).flush()
+
+    def fileno(self) -> int:
+        return self._real.fileno()
+
+    def isatty(self) -> bool:
+        return self._real.isatty()
+
+
 # ── Module-level configuration ─────────────────────────────────────────────────
 
 _timeout: int = 5
@@ -48,6 +74,9 @@ CHECK_GROUPS = ("ports", "ssh", "tls", "http")
 # ── Thread-local result tracking ───────────────────────────────────────────────
 
 _thread_local = threading.local()
+
+# Install the thread-local stdout dispatcher now that _thread_local exists.
+sys.stdout = _ThreadLocalStdout(sys.stdout)  # type: ignore[assignment]
 
 # Serialises the KEXINIT monkey-patch in check_ssh_algorithms and
 # check_ssh_legacy so parallel threads do not overwrite each other's patch.
@@ -902,11 +931,18 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
 
 
 def run_audit_buffered(target: str, only: set[str] | None) -> str:
-    """Run run_audit() with stdout captured and return it as a string."""
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    """Run run_audit() with stdout captured per-thread and return it as a string.
+
+    Sets _thread_local.output to a StringIO buffer so that the
+    _ThreadLocalStdout dispatcher routes this thread's print() calls into
+    the buffer instead of the real stdout. Other threads are unaffected.
+    """
+    _thread_local.output = io.StringIO()
+    try:
         run_audit(target, only)
-    return buf.getvalue()
+        return _thread_local.output.getvalue()
+    finally:
+        _thread_local.output = None
 
 
 # ── Multi-host summary ─────────────────────────────────────────────────────────

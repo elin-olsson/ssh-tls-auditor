@@ -4,7 +4,7 @@ A command-line security audit tool that checks a target server for common SSH an
 
 ## Prerequisites
 
-- Python 3.7 or later
+- Python 3.10 or later
 - pip
 
 Check your Python version:
