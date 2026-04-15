@@ -492,6 +492,60 @@ def check_ssh_banner(target: str) -> None:
         passed("OpenSSH version", f"{raw} — current")
 
 
+def check_ssh_host_keys(target: str) -> None:
+    """Check the SSH host key types and sizes advertised by the server.
+
+    Connects to port 22 and reads the server's host key via paramiko.
+    Checks:
+      - RSA keys with < 3072 bits are flagged as [FAIL] (NIST recommends 3072+)
+      - DSA keys are always [FAIL] — fixed 1024-bit, broken
+      - ECDSA keys are [PASS] (256/384/521-bit curves)
+      - ED25519 keys are [PASS] — recommended
+    """
+    _thread_local.category = "SSH Host Keys"
+    print("\n[SSH Host Keys]")
+
+    transport = None
+    try:
+        transport = paramiko.Transport((target, 22))
+        transport.start_client(timeout=_timeout)
+        host_key = transport.get_remote_server_key()
+
+        key_type = host_key.get_name()
+        bits = host_key.get_bits() if hasattr(host_key, "get_bits") else None
+
+        if key_type == "ssh-dss":
+            failed(
+                "Host key type",
+                "DSA — broken (fixed 1024-bit, deprecated since OpenSSH 7.0)",
+                "Replace DSA host key with ED25519: ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key",
+            )
+        elif key_type == "ssh-rsa":
+            if bits is not None and bits < 3072:
+                failed(
+                    "Host key type",
+                    f"RSA {bits}-bit — below recommended minimum of 3072 bits",
+                    "Regenerate with a larger key: ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key  or switch to ED25519.",
+                )
+            else:
+                size_str = f"RSA {bits}-bit" if bits else "RSA"
+                passed("Host key type", f"{size_str} — meets minimum size requirement")
+        elif key_type in ("ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"):
+            curve = key_type.split("nistp")[1]
+            passed("Host key type", f"ECDSA P-{curve}")
+        elif key_type == "ssh-ed25519":
+            passed("Host key type", "ED25519 — recommended")
+        else:
+            info("Host key type", key_type)
+
+    except Exception as e:
+        info("SSH Host Keys", f"could not retrieve host key — {e}")
+
+    finally:
+        if transport:
+            transport.close()
+
+
 def check_ssh_root_login(target: str) -> None:
     """Probe whether root login is enabled by sending a 'none' auth request.
 
@@ -1151,6 +1205,7 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
     if all_groups or "ssh" in only:
         check_ssh_algorithms(target)
         check_ssh_banner(target)
+        check_ssh_host_keys(target)
         check_ssh_root_login(target)
         check_ssh_password_auth(target)
         check_ssh_legacy(target)
