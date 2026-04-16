@@ -22,6 +22,7 @@ Usage:
     python3 auditor.py -f hosts.txt --parallel --timeout 10
     python3 auditor.py example.com --only ssh tls
     python3 auditor.py example.com --quiet
+    python3 auditor.py example.com --config
 """
 
 import argparse
@@ -75,7 +76,13 @@ class _ThreadLocalStdout:
 
 _timeout: int = 5
 _quiet:   bool = False
+_config:  bool = False
 CHECK_GROUPS = ("ports", "ssh", "tls", "http")
+
+# Best-practice algorithm lists used by the config generator.
+_SSH_BEST_KEX     = "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
+_SSH_BEST_CIPHERS = "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
+_SSH_BEST_MACS    = "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com"
 
 # ANSI colour codes — only used when stdout is a real TTY
 _ANSI_GREEN  = "\033[32m"
@@ -1335,6 +1342,115 @@ def write_html(path: str, targets: list[str]) -> None:
     print(f"Results written to {path}")
 
 
+# ── Config generator ───────────────────────────────────────────────────────────
+
+def _config_block(title: str, lines: list[str]) -> None:
+    """Print a labelled config snippet box to stdout."""
+    width  = max(60, max((len(l) for l in lines), default=0) + 4)
+    border = "─" * width
+    label  = _colourise(f"  Suggested {title}", _ANSI_BLUE)
+    print(f"\n{label}")
+    print(f"  ┌{border}┐")
+    for line in lines:
+        print(f"  │  {line:<{width - 2}}│")
+    print(f"  └{border}┘")
+
+
+def generate_configs(target: str) -> None:
+    """Generate ready-to-paste config snippets based on FAIL results for target.
+
+    Builds an sshd_config section for SSH failures and an nginx section for
+    TLS/HTTP failures. Only lines relevant to actual failures are included.
+    """
+    with _results_lock:
+        snapshot = [r for r in _results if r["host"] == target and r["result"] == "FAIL"]
+
+    if not snapshot:
+        return
+
+    fail_categories = {r["category"] for r in snapshot}
+    fail_checks     = {r["check"]    for r in snapshot}
+
+    # ── sshd_config ───────────────────────────────────────────────────────────
+    ssh_cats = {"SSH Algorithms", "SSH Root Login", "SSH Password Auth",
+                "SSH Host Keys",  "SSH Banner"}
+    if fail_categories & ssh_cats:
+        lines: list[str] = [
+            "# /etc/ssh/sshd_config — apply changes, then:",
+            "# sudo systemctl reload sshd",
+            "",
+        ]
+
+        if "SSH Algorithms" in fail_categories:
+            lines += [
+                f"KexAlgorithms {_SSH_BEST_KEX}",
+                f"Ciphers       {_SSH_BEST_CIPHERS}",
+                f"MACs          {_SSH_BEST_MACS}",
+                "",
+            ]
+        if "SSH Root Login" in fail_categories:
+            lines.append("PermitRootLogin no")
+        if "SSH Password Auth" in fail_categories:
+            lines.append("PasswordAuthentication no")
+        if "SSH Host Keys" in fail_categories:
+            lines += [
+                "",
+                "# Regenerate host key (run as root, then reload sshd):",
+                "# ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ''",
+            ]
+        if "SSH Banner" in fail_categories:
+            lines += [
+                "",
+                "# OpenSSH is outdated — upgrade the package:",
+                "# sudo apt upgrade openssh-server  or  sudo dnf upgrade openssh-server",
+            ]
+
+        _config_block("sshd_config", lines)
+
+    # ── nginx ─────────────────────────────────────────────────────────────────
+    web_cats = {"TLS Version Support", "TLS Cipher Suites", "HTTP Security"}
+    if fail_categories & web_cats:
+        lines = [
+            f"# nginx server block for {target}",
+            "# Place inside your 'server {{ listen 443 ssl; ... }}' block.",
+            "",
+        ]
+
+        if "TLS Version Support" in fail_categories:
+            lines += ["ssl_protocols TLSv1.2 TLSv1.3;", ""]
+
+        if "TLS Cipher Suites" in fail_categories:
+            lines += [
+                "ssl_ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM';",
+                "ssl_prefer_server_ciphers on;",
+                "",
+            ]
+
+        if "HSTS header" in fail_checks:
+            lines.append(
+                "add_header Strict-Transport-Security 'max-age=15552000; includeSubDomains' always;"
+            )
+        if "X-Frame-Options" in fail_checks:
+            lines.append("add_header X-Frame-Options 'SAMEORIGIN' always;")
+        if "X-Content-Type-Options" in fail_checks:
+            lines.append("add_header X-Content-Type-Options 'nosniff' always;")
+        if "Content-Security-Policy" in fail_checks:
+            lines.append("add_header Content-Security-Policy \"default-src 'self'\" always;")
+
+        if "HTTP → HTTPS redirect" in fail_checks:
+            lines += [
+                "",
+                "# Separate server block for HTTP → HTTPS redirect:",
+                "server {",
+                "    listen 80;",
+                f"    server_name {target};",
+                "    return 301 https://$host$request_uri;",
+                "}",
+            ]
+
+        _config_block("nginx config", lines)
+
+
 # ── Per-host audit ─────────────────────────────────────────────────────────────
 
 def run_audit(target: str, only: set[str] | None = None) -> None:
@@ -1397,6 +1513,9 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
                 print(f"  • {r['check']}: {r['remediation']}")
 
     print(f"╚{border}╝")
+
+    if _config:
+        generate_configs(target)
 
 
 def run_audit_buffered(target: str, only: set[str] | None) -> str:
@@ -1496,11 +1615,16 @@ def main() -> None:
         "--quiet", action="store_true",
         help="only print FAIL results — suppress PASS and INFO",
     )
+    parser.add_argument(
+        "--config", action="store_true",
+        help="after each audit, print suggested sshd_config and nginx snippets for all failures",
+    )
     args = parser.parse_args()
 
-    global _timeout, _quiet
+    global _timeout, _quiet, _config
     _timeout = args.timeout
     _quiet   = args.quiet
+    _config  = args.config
 
     only: set[str] | None = set(args.only) if args.only else None
 

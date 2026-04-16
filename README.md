@@ -66,6 +66,9 @@ python3 auditor.py -f hosts.txt --parallel --timeout 3
 
 # Only print failed checks (useful in CI/CD)
 python3 auditor.py example.com --quiet
+
+# Generate ready-to-paste config fixes for all failures
+python3 auditor.py example.com --config
 ```
 
 ### Check groups (`--only`)
@@ -307,6 +310,16 @@ Output includes a timestamp and an array of result objects with `host`, `categor
 | `1` | One or more checks failed |
 
 Useful in CI/CD pipelines: the tool exits with code 1 if any `[FAIL]` result is found.
+
+### Config generator
+
+Use `--config` to generate ready-to-paste configuration snippets for every failure found:
+
+```bash
+python3 auditor.py example.com --config
+```
+
+After the audit summary, the tool prints a targeted `sshd_config` section and/or an nginx server block containing only the lines needed to fix the detected issues — weak algorithm lists, missing security headers, redirect rules, and so on. Nothing is written to disk; output goes to stdout so you can review before applying.
 
 ## Output legend
 
