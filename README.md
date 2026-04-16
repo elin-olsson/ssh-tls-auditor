@@ -64,6 +64,10 @@ python3 auditor.py example.com --only tls http
 python3 auditor.py example.com --timeout 10
 python3 auditor.py -f hosts.txt --parallel --timeout 3
 
+# Scan a network range (CIDR notation)
+python3 auditor.py 192.168.1.0/24 --parallel --only ssh
+python3 auditor.py 10.0.0.0/28 --parallel --timeout 3
+
 # Only print failed checks (useful in CI/CD)
 python3 auditor.py example.com --quiet
 

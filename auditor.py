@@ -1621,6 +1621,31 @@ def print_multi_summary(targets: list[str]) -> None:
     print(f"╚{border}╝")
 
 
+# ── Network range expansion ────────────────────────────────────────────────────
+
+def _expand_targets(raw: list[str]) -> list[str]:
+    """Expand CIDR blocks to individual IP addresses; pass hostnames through unchanged.
+
+    Examples:
+      "192.168.1.0/24"  → ["192.168.1.1", ..., "192.168.1.254"]
+      "10.0.0.5/32"     → ["10.0.0.5"]
+      "example.com"     → ["example.com"]
+    """
+    expanded: list[str] = []
+    for t in raw:
+        try:
+            net   = ipaddress.ip_network(t, strict=False)
+            hosts = list(net.hosts())
+            if hosts:
+                expanded.extend(str(h) for h in hosts)
+            else:
+                # /32 or /128 — single address
+                expanded.append(str(net.network_address))
+        except ValueError:
+            expanded.append(t)  # plain hostname or IP — keep as-is
+    return expanded
+
+
 # ── Watch mode helpers ─────────────────────────────────────────────────────────
 
 def _diff_results(
@@ -1746,6 +1771,15 @@ def main() -> None:
     if not targets:
         parser.print_help()
         sys.exit(1)
+
+    targets = _expand_targets(targets)
+
+    if len(targets) > 254:
+        print(
+            f"Warning: {len(targets)} targets — this may take a while. "
+            "Consider using --parallel and --only to speed up the scan.",
+            file=sys.stderr,
+        )
 
     def _run_once() -> None:
         if args.parallel and len(targets) > 1:
