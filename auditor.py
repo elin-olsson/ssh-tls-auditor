@@ -87,8 +87,16 @@ _SSH_BEST_MACS    = "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 # ANSI colour codes — only used when stdout is a real TTY
 _ANSI_GREEN  = "\033[32m"
 _ANSI_RED    = "\033[31m"
+_ANSI_YELLOW = "\033[33m"
 _ANSI_BLUE   = "\033[34m"
 _ANSI_RESET  = "\033[0m"
+
+# Grade thresholds: (min_criticals, grade)
+_GRADE_THRESHOLDS = [(0, "A"), (1, "B"), (2, "C"), (4, "D"), (float("inf"), "F")]
+_GRADE_COLOURS = {"A": _ANSI_GREEN, "B": _ANSI_GREEN, "C": _ANSI_YELLOW,
+                  "D": _ANSI_YELLOW, "F": _ANSI_RED}
+_BADGE_COLOURS = {"A": "brightgreen", "B": "green", "C": "yellow",
+                  "D": "orange",      "F": "red"}
 
 
 def _colourise(text: str, code: str) -> str:
@@ -133,7 +141,8 @@ _results_lock = threading.Lock()
 
 # ── Result helpers ─────────────────────────────────────────────────────────────
 
-def _record(result: str, label: str, detail: str, remediation: str = "") -> None:
+def _record(result: str, label: str, detail: str,
+            remediation: str = "", severity: str = "") -> None:
     with _results_lock:
         _results.append({
             "host":        _host(),
@@ -142,6 +151,7 @@ def _record(result: str, label: str, detail: str, remediation: str = "") -> None
             "result":      result,
             "detail":      detail,
             "remediation": remediation,
+            "severity":    severity,
         })
 
 
@@ -157,10 +167,14 @@ def passed(label: str, detail: str = "") -> None:
     print(line)
 
 
-def failed(label: str, detail: str = "", remediation: str = "") -> None:
+def failed(label: str, detail: str = "", remediation: str = "",
+           severity: str = "WARNING") -> None:
     _counts()["fail"] += 1
-    _record("FAIL", label, detail, remediation)
-    tag  = _colourise("[FAIL]", _ANSI_RED)
+    _record("FAIL", label, detail, remediation, severity)
+    if severity == "CRITICAL":
+        tag = _colourise("[CRIT]", _ANSI_RED)
+    else:
+        tag = _colourise("[WARN]", _ANSI_YELLOW)
     line = f"  {tag}  {label}"
     if detail:
         line += f" — {detail}"
@@ -548,6 +562,7 @@ def check_ssh_host_keys(target: str) -> None:
                 "Host key type",
                 "DSA — broken (fixed 1024-bit, deprecated since OpenSSH 7.0)",
                 "Replace DSA host key with ED25519: ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key",
+                severity="CRITICAL",
             )
         elif key_type == "ssh-rsa":
             if bits is not None and bits < 3072:
@@ -602,6 +617,7 @@ def check_ssh_root_login(target: str) -> None:
             "Root login",
             "enabled — authenticated as root with no credentials",
             "Set PermitRootLogin no in /etc/ssh/sshd_config and run: sudo systemctl reload sshd",
+            severity="CRITICAL",
         )
 
     except paramiko.BadAuthenticationType as e:
@@ -610,6 +626,7 @@ def check_ssh_root_login(target: str) -> None:
             "Root login",
             f"enabled — server offered auth methods: {methods}",
             "Set PermitRootLogin no in /etc/ssh/sshd_config and run: sudo systemctl reload sshd",
+            severity="CRITICAL",
         )
 
     except paramiko.AuthenticationException:
@@ -660,6 +677,7 @@ def check_ssh_password_auth(target: str) -> None:
                 "Disable password auth: set PasswordAuthentication no in sshd_config. "
                 "Ensure SSH key-based login works first, then: sudo systemctl reload sshd"
             ),
+            severity="CRITICAL",
         )
 
     except Exception as e:
@@ -735,6 +753,7 @@ def check_ssh_legacy(target: str) -> None:
                 "Legacy KEX only",
                 f"device supports only: {', '.join(sorted(legacy_kex_present))}",
                 legacy_remediation,
+                severity="CRITICAL",
             )
         if legacy_ciphers_present and not has_modern_ciphers:
             failed(
@@ -754,6 +773,7 @@ def check_ssh_legacy(target: str) -> None:
                 "No modern key exchange available",
                 f"only deprecated KEX advertised: {', '.join(legacy_present)}",
                 legacy_remediation,
+                severity="CRITICAL",
             )
         if ciphers and not has_modern_ciphers:
             failed(
@@ -813,7 +833,8 @@ def check_tls_versions(target: str) -> None:
                     if should_succeed:
                         passed(label, "supported")
                     else:
-                        failed(label, "supported — should be disabled", tls_legacy_remediation)
+                        failed(label, "supported — should be disabled",
+                               tls_legacy_remediation, severity="CRITICAL")
         except ssl.SSLError:
             if should_succeed:
                 info(label, "not supported by server")
@@ -868,11 +889,11 @@ def check_tls_ciphers(target: str) -> None:
     print("\n[TLS Cipher Suites]")
 
     weak_groups = [
-        ("NULL ciphers",   "NULL",   "no encryption — data sent in cleartext"),
-        ("aNULL ciphers",  "aNULL",  "anonymous auth — no server identity verification"),
-        ("EXPORT ciphers", "EXPORT", "export-grade 40/56-bit encryption — trivially broken"),
-        ("RC4 ciphers",    "RC4",    "RC4 stream cipher — cryptographically broken"),
-        ("3DES ciphers",   "3DES",   "Triple DES — vulnerable to SWEET32 birthday attack"),
+        ("NULL ciphers",   "NULL",   "no encryption — data sent in cleartext",          "CRITICAL"),
+        ("aNULL ciphers",  "aNULL",  "anonymous auth — no server identity verification", "CRITICAL"),
+        ("EXPORT ciphers", "EXPORT", "export-grade 40/56-bit encryption — trivially broken", "CRITICAL"),
+        ("RC4 ciphers",    "RC4",    "RC4 stream cipher — cryptographically broken",    "CRITICAL"),
+        ("3DES ciphers",   "3DES",   "Triple DES — vulnerable to SWEET32 birthday attack", "WARNING"),
     ]
 
     remediation = (
@@ -882,7 +903,7 @@ def check_tls_ciphers(target: str) -> None:
     )
 
     reachable = True
-    for label, cipher_str, description in weak_groups:
+    for label, cipher_str, description, sev in weak_groups:
         if not reachable:
             break
 
@@ -898,7 +919,8 @@ def check_tls_ciphers(target: str) -> None:
             with socket.create_connection((target, 443), timeout=_timeout) as raw:
                 with ctx.wrap_socket(raw) as ssock:
                     negotiated = ssock.cipher()[0] if ssock.cipher() else "unknown"
-                    failed(label, f"server accepted {negotiated} — {description}", remediation)
+                    failed(label, f"server accepted {negotiated} — {description}",
+                           remediation, severity=sev)
         except ssl.SSLError:
             passed(label, "not accepted by server")
         except (socket.timeout, ConnectionRefusedError, OSError) as e:
@@ -934,6 +956,7 @@ def check_tls_certificate(target: str) -> None:
             "Certificate trust",
             reason,
             "Ensure the full certificate chain is installed and the cert is issued by a trusted CA.",
+            severity="CRITICAL",
         )
         return
     except ssl.SSLError as e:
@@ -966,12 +989,14 @@ def check_tls_certificate(target: str) -> None:
                 "Certificate expiry",
                 f"expired {abs(days_left)} day(s) ago ({not_after.date()})",
                 "Renew the certificate immediately. certbot: sudo certbot renew --force-renewal",
+                severity="CRITICAL",
             )
         elif days_left < 30:
             failed(
                 "Certificate expiry",
                 f"expires in {days_left} day(s) ({not_after.date()}) — renew immediately",
                 "Renew the certificate now. certbot: sudo certbot renew",
+                severity="CRITICAL",
             )
         elif days_left < 90:
             info("Certificate expiry",
@@ -993,12 +1018,14 @@ def check_tls_certificate(target: str) -> None:
                 "Hostname match",
                 f"certificate does not cover {target} — IP SANs: {', '.join(ip_sans)}",
                 f"Reissue the certificate with IP SAN: {target}",
+                severity="CRITICAL",
             )
         else:
             failed(
                 "Hostname match",
                 f"certificate has no IP SANs — does not cover {target}",
                 f"Reissue the certificate with IP SAN: {target}",
+                severity="CRITICAL",
             )
     else:
         dns_sans = [name for kind, name in cert.get("subjectAltName", [])
@@ -1014,6 +1041,7 @@ def check_tls_certificate(target: str) -> None:
                     "Hostname match",
                     f"certificate does not cover {target} — SANs: {preview}",
                     f"Reissue the certificate to include '{target}' in the Subject Alternative Name (SAN) field.",
+                    severity="CRITICAL",
                 )
         else:
             cn = subject.get("commonName", "")
@@ -1024,6 +1052,7 @@ def check_tls_certificate(target: str) -> None:
                     "Hostname match",
                     f"certificate CN '{cn}' does not match {target}",
                     f"Reissue the certificate to include '{target}' in the Subject Alternative Name (SAN) field.",
+                    severity="CRITICAL",
                 )
 
 
@@ -1342,6 +1371,32 @@ def write_html(path: str, targets: list[str]) -> None:
     print(f"Results written to {path}")
 
 
+# ── Grade computation ──────────────────────────────────────────────────────────
+
+def compute_grade(target: str) -> str:
+    """Return an A–F grade for target based on number of CRITICAL failures."""
+    with _results_lock:
+        criticals = sum(
+            1 for r in _results
+            if r["host"] == target and r["result"] == "FAIL"
+            and r.get("severity") == "CRITICAL"
+        )
+    warnings = sum(
+        1 for r in _results
+        if r["host"] == target and r["result"] == "FAIL"
+        and r.get("severity") != "CRITICAL"
+    )
+    if criticals == 0 and warnings == 0:
+        return "A"
+    if criticals == 0:
+        return "B"
+    if criticals == 1:
+        return "C"
+    if criticals <= 3:
+        return "D"
+    return "F"
+
+
 # ── Config generator ───────────────────────────────────────────────────────────
 
 def _config_block(title: str, lines: list[str]) -> None:
@@ -1486,9 +1541,11 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
 
     c     = _counts()
     total = c["pass"] + c["fail"]
+    grade = compute_grade(target)
+    grade_str = _colourise(f"  Grade: {grade}", _GRADE_COLOURS[grade])
     print(f"\n╔{border}╗")
     print(f"  Summary — {total} checks")
-    print(f"  [PASS] {c['pass']}   [FAIL] {c['fail']}")
+    print(f"  [PASS] {c['pass']}   [FAIL] {c['fail']}   {grade_str}")
     if c["fail"] == 0:
         print("  All checks passed.")
     else:
@@ -1619,6 +1676,10 @@ def main() -> None:
         "--config", action="store_true",
         help="after each audit, print suggested sshd_config and nginx snippets for all failures",
     )
+    parser.add_argument(
+        "--badge", action="store_true",
+        help="print a Markdown badge for each target after the audit",
+    )
     args = parser.parse_args()
 
     global _timeout, _quiet, _config
@@ -1665,6 +1726,15 @@ def main() -> None:
 
     if args.json:
         write_json(args.json)
+
+    if args.badge:
+        print("\nMarkdown badges:")
+        for t in targets:
+            grade  = compute_grade(t)
+            colour = _BADGE_COLOURS[grade]
+            label  = t.replace("-", "--").replace("_", "__")
+            url    = f"https://img.shields.io/badge/{label}-{grade}-{colour}"
+            print(f"  ![{t}]({url})")
 
     # Exit with code 1 if any check failed — useful in CI/CD pipelines
     has_failures = any(r["result"] == "FAIL" for r in _results)
