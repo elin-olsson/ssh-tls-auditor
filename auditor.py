@@ -38,6 +38,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 import warnings
 
 import dns.resolver
@@ -1620,6 +1621,43 @@ def print_multi_summary(targets: list[str]) -> None:
     print(f"╚{border}╝")
 
 
+# ── Watch mode helpers ─────────────────────────────────────────────────────────
+
+def _diff_results(
+    prev: list[dict], curr: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Return (new_failures, resolved_failures) between two result snapshots."""
+    def key(r: dict) -> tuple:
+        return (r["host"], r["category"], r["check"])
+
+    prev_fails = {key(r): r for r in prev if r["result"] == "FAIL"}
+    curr_fails = {key(r): r for r in curr if r["result"] == "FAIL"}
+
+    new_failures = [r for k, r in curr_fails.items() if k not in prev_fails]
+    resolved     = [r for k, r in prev_fails.items() if k not in curr_fails]
+    return new_failures, resolved
+
+
+def _print_watch_diff(new_failures: list[dict], resolved: list[dict]) -> None:
+    """Print a compact change summary between two watch scans."""
+    if not new_failures and not resolved:
+        print(_colourise("  No changes since last scan.", _ANSI_BLUE))
+        return
+
+    if new_failures:
+        print(_colourise(f"  ▲ {len(new_failures)} new failure(s):", _ANSI_RED))
+        for r in new_failures:
+            sev = r.get("severity", "WARNING")
+            tag = _colourise("[CRIT]" if sev == "CRITICAL" else "[WARN]",
+                             _ANSI_RED if sev == "CRITICAL" else _ANSI_YELLOW)
+            print(f"    {tag}  {r['host']} / {r['check']} — {r['detail']}")
+
+    if resolved:
+        print(_colourise(f"  ▼ {len(resolved)} resolved:", _ANSI_GREEN))
+        for r in resolved:
+            print(f"    {_colourise('[FIXED]', _ANSI_GREEN)}  {r['host']} / {r['check']}")
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1680,6 +1718,10 @@ def main() -> None:
         "--badge", action="store_true",
         help="print a Markdown badge for each target after the audit",
     )
+    parser.add_argument(
+        "--watch", type=int, metavar="SECONDS",
+        help="re-scan every SECONDS and show what changed (Ctrl+C to stop)",
+    )
     args = parser.parse_args()
 
     global _timeout, _quiet, _config
@@ -1705,18 +1747,55 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    if args.parallel and len(targets) > 1:
-        max_workers = min(len(targets), 20)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(run_audit_buffered, t, only) for t in targets]
-            for future in futures:
-                print(future.result(), end="")
-    else:
-        for target in targets:
-            run_audit(target, only)
+    def _run_once() -> None:
+        if args.parallel and len(targets) > 1:
+            max_workers = min(len(targets), 20)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(run_audit_buffered, t, only) for t in targets]
+                for future in futures:
+                    print(future.result(), end="")
+        else:
+            for target in targets:
+                run_audit(target, only)
 
-    if len(targets) > 1:
-        print_multi_summary(targets)
+        if len(targets) > 1:
+            print_multi_summary(targets)
+
+    if args.watch:
+        prev_snapshot: list[dict] = []
+        scan_num = 0
+        try:
+            while True:
+                scan_num += 1
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                sep = "═" * 60
+                print(f"\n╔{sep}╗")
+                print(f"  Watch scan #{scan_num}  —  {now}")
+                print(f"╚{sep}╝")
+
+                with _results_lock:
+                    _results.clear()
+
+                _run_once()
+
+                with _results_lock:
+                    curr_snapshot = list(_results)
+
+                if scan_num > 1:
+                    new_fails, resolved = _diff_results(prev_snapshot, curr_snapshot)
+                    sep2 = "─" * 60
+                    print(f"\n  Changes since scan #{scan_num - 1}:")
+                    print(f"  {sep2}")
+                    _print_watch_diff(new_fails, resolved)
+
+                prev_snapshot = curr_snapshot
+                print(f"\n  Next scan in {args.watch}s — Ctrl+C to stop")
+                time.sleep(args.watch)
+
+        except KeyboardInterrupt:
+            print("\n\nWatch mode stopped.")
+    else:
+        _run_once()
 
     if args.csv:
         write_csv(args.csv)
