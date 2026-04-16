@@ -107,6 +107,7 @@ scanme.nmap.org
 | SSH password auth | `auth_password` probe with fake credentials | Server rejects password method |
 | SSH legacy detection | Banner + algorithm fingerprint against device DB | No known legacy device fingerprint |
 | CAA records | DNS lookup via `dnspython` | At least one CAA record present |
+| DNSSEC | DNSKEY lookup via `dnspython` | DNSKEY records present |
 | TLS versions | TLS handshake per version via `ssl` | 1.2/1.3 supported, 1.0/1.1 disabled |
 | TLS cipher suites | Handshake attempted with each weak cipher group | NULL, aNULL, EXPORT, RC4, 3DES all rejected |
 | TLS certificate trust | Full chain verification against system CA bundle | Issued by a trusted CA |

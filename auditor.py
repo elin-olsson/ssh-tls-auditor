@@ -877,6 +877,37 @@ def check_dns_caa(target: str) -> None:
         info("CAA records", f"DNS lookup failed — {e}")
 
 
+def check_dns_dnssec(target: str) -> None:
+    """Check whether the target domain has DNSSEC enabled.
+
+    Looks for DNSKEY records at the target domain. Their presence indicates
+    that the zone is DNSSEC-signed, protecting DNS responses against spoofing
+    and cache poisoning attacks.
+
+    Skipped for IP addresses.
+    """
+    _thread_local.category = "DNS / DNSSEC"
+    print("\n[DNS / DNSSEC]")
+
+    if _is_ip(target):
+        info("DNSSEC", "skipped — target is an IP address")
+        return
+
+    try:
+        dns.resolver.resolve(target, "DNSKEY")
+        passed("DNSSEC", "DNSKEY records present — zone is DNSSEC-signed")
+    except dns.resolver.NoAnswer:
+        failed(
+            "DNSSEC",
+            "no DNSKEY records — zone is not DNSSEC-signed",
+            f"Enable DNSSEC at your DNS registrar or DNS provider for {target}",
+        )
+    except dns.resolver.NXDOMAIN:
+        info("DNSSEC", "domain does not exist")
+    except dns.exception.DNSException as e:
+        info("DNSSEC", f"DNS lookup failed — {e}")
+
+
 def check_tls_ciphers(target: str) -> None:
     """Check whether port 443 accepts known weak cipher suites.
 
@@ -1218,9 +1249,9 @@ def _is_ip(s: str) -> bool:
 
 def write_csv(path: str) -> None:
     """Write all collected results to a CSV file."""
-    fieldnames = ["host", "category", "check", "result", "detail", "remediation"]
+    fieldnames = ["host", "category", "check", "result", "severity", "detail", "remediation"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(_results)
     print(f"Results written to {path}")
@@ -1260,8 +1291,13 @@ tr:hover td { background: #f9fbfd; }
 .badge { display: inline-block; padding: 2px 8px; border-radius: 3px;
          font-size: 11px; font-weight: 700; letter-spacing: 0.5px; }
 .pass  { background: #e6f4ea; color: #1e7e34; }
-.fail  { background: #fdecea; color: #c0392b; }
+.crit  { background: #fdecea; color: #c0392b; }
+.warn  { background: #fff3cd; color: #856404; }
 .info  { background: #e8f0fe; color: #1a56b0; }
+.grade { font-size: 28px; font-weight: 700; width: 56px; }
+.grade-a, .grade-b { color: #1e7e34; }
+.grade-c, .grade-d { color: #856404; }
+.grade-f            { color: #c0392b; }
 .summary-box { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
 .summary-card { background: #fff; border-radius: 6px; padding: 16px 24px;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.1); min-width: 140px; text-align: center; }
@@ -1327,7 +1363,10 @@ def write_html(path: str, targets: list[str]) -> None:
         total = c["pass"] + c["fail"] + c["info"]
 
         parts.append(f'<h2>{e(target)}</h2>\n<div class="host-block">\n')
+        grade    = compute_grade(target)
+        grade_cls = f"grade-{grade.lower()}"
         parts.append('<div class="summary-box">\n')
+        parts.append(f'<div class="summary-card"><div class="number grade {grade_cls}">{grade}</div><div class="label">Grade</div></div>\n')
         parts.append(f'<div class="summary-card"><div class="number num-pass">{c["pass"]}</div><div class="label">Pass</div></div>\n')
         parts.append(f'<div class="summary-card"><div class="number num-fail">{c["fail"]}</div><div class="label">Fail</div></div>\n')
         parts.append(f'<div class="summary-card"><div class="number num-info">{c["info"]}</div><div class="label">Info</div></div>\n')
@@ -1346,7 +1385,13 @@ def write_html(path: str, targets: list[str]) -> None:
             parts.append(f'<h3>{e(cat)}</h3>\n')
             parts.append('<table><thead><tr><th>Check</th><th>Result</th><th>Detail</th></tr></thead><tbody>\n')
             for row in rows:
-                badge_cls = row["result"].lower()
+                if row["result"] == "FAIL":
+                    sev = row.get("severity", "WARNING")
+                    badge_cls  = "crit" if sev == "CRITICAL" else "warn"
+                    badge_text = "CRIT" if sev == "CRITICAL" else "WARN"
+                else:
+                    badge_cls  = row["result"].lower()
+                    badge_text = row["result"]
                 remediation_html = ""
                 if row["result"] == "FAIL" and row.get("remediation"):
                     remediation_html = (
@@ -1357,7 +1402,7 @@ def write_html(path: str, targets: list[str]) -> None:
                 parts.append(
                     f'<tr>'
                     f'<td>{e(row["check"])}</td>'
-                    f'<td><span class="badge {badge_cls}">{e(row["result"])}</span></td>'
+                    f'<td><span class="badge {badge_cls}">{e(badge_text)}</span></td>'
                     f'<td>{e(row["detail"])}{remediation_html}</td>'
                     f'</tr>\n'
                 )
@@ -1534,6 +1579,7 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         check_ssh_legacy(target)
     if all_groups or "tls" in only:
         check_dns_caa(target)
+        check_dns_dnssec(target)
         check_tls_versions(target)
         check_tls_ciphers(target)
         check_tls_certificate(target)
