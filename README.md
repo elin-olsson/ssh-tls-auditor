@@ -97,6 +97,7 @@ scanme.nmap.org
 | SSH password auth | `auth_password` probe with fake credentials | Server rejects password method |
 | SSH legacy detection | Banner + algorithm fingerprint against device DB | No known legacy device fingerprint |
 | TLS versions | TLS handshake per version via `ssl` | 1.2/1.3 supported, 1.0/1.1 disabled |
+| TLS cipher suites | Handshake attempted with each weak cipher group | NULL, aNULL, EXPORT, RC4, 3DES all rejected |
 | TLS certificate trust | Full chain verification against system CA bundle | Issued by a trusted CA |
 | TLS certificate expiry | Parsed from `notAfter` field | Valid for > 90 days |
 | TLS hostname match | SAN list (DNS + IP) checked against target | Certificate covers the target |
@@ -132,6 +133,8 @@ scanme.nmap.org
 A matched device is reported as `[INFO]` with a remediation note. If the device advertises **only** deprecated key exchange algorithms with no modern alternative, this is reported as `[FAIL]` — the session cannot be made secure regardless of client configuration.
 
 **TLS version check** — attempts a TLS handshake for each version in isolation by forcing both the minimum and maximum version on a fresh SSL context. This ensures only that specific version is negotiated, not the highest mutually supported one. TLS 1.2 and 1.3 are `[PASS]`. TLS 1.0 and 1.1 are `[FAIL]` — deprecated per RFC 8996 and disabled by default in modern browsers and libraries. If a version is not supported by the local Python/OpenSSL build (e.g. TLS 1.0 on hardened systems), the check is reported as `[INFO]`.
+
+**TLS cipher suite check** — for each known weak cipher group (NULL, aNULL, EXPORT, RC4, 3DES), a fresh SSL context is created that allows *only* that group. If the server completes the handshake it is `[FAIL]` — the weak cipher is accepted. If it refuses, `[PASS]`. Groups not available in the local OpenSSL build are silently skipped.
 
 **TLS certificate check** — retrieves the certificate from port 443 and verifies three things:
 

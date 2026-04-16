@@ -809,6 +809,57 @@ def check_tls_versions(target: str) -> None:
             info(label, f"could not reach port 443 — {e}")
 
 
+def check_tls_ciphers(target: str) -> None:
+    """Check whether port 443 accepts known weak cipher suites.
+
+    For each weak cipher group a fresh SSLContext is created with only that
+    group allowed. A successful handshake means the server accepts the weak
+    cipher — [FAIL]. An SSLError on the handshake means the server refused
+    it — [PASS]. If the local OpenSSL build does not include a cipher group
+    at all, that group is silently skipped.
+    """
+    _thread_local.category = "TLS Cipher Suites"
+    print("\n[TLS Cipher Suites]")
+
+    weak_groups = [
+        ("NULL ciphers",   "NULL",   "no encryption — data sent in cleartext"),
+        ("aNULL ciphers",  "aNULL",  "anonymous auth — no server identity verification"),
+        ("EXPORT ciphers", "EXPORT", "export-grade 40/56-bit encryption — trivially broken"),
+        ("RC4 ciphers",    "RC4",    "RC4 stream cipher — cryptographically broken"),
+        ("3DES ciphers",   "3DES",   "Triple DES — vulnerable to SWEET32 birthday attack"),
+    ]
+
+    remediation = (
+        "Restrict cipher suites in your web server. "
+        "Nginx: ssl_ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM'; ssl_prefer_server_ciphers on;  "
+        "Apache: SSLCipherSuite 'ECDHE+AESGCM:ECDHE+CHACHA20'"
+    )
+
+    reachable = True
+    for label, cipher_str, description in weak_groups:
+        if not reachable:
+            break
+
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.set_ciphers(cipher_str)
+        except ssl.SSLError:
+            continue  # cipher group not available in this OpenSSL build
+
+        try:
+            with socket.create_connection((target, 443), timeout=_timeout) as raw:
+                with ctx.wrap_socket(raw) as ssock:
+                    negotiated = ssock.cipher()[0] if ssock.cipher() else "unknown"
+                    failed(label, f"server accepted {negotiated} — {description}", remediation)
+        except ssl.SSLError:
+            passed(label, "not accepted by server")
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            info(label, f"could not reach port 443 — {e}")
+            reachable = False
+
+
 def check_tls_certificate(target: str) -> None:
     """Retrieve the TLS certificate from port 443 and check:
 
@@ -1272,6 +1323,7 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         check_ssh_legacy(target)
     if all_groups or "tls" in only:
         check_tls_versions(target)
+        check_tls_ciphers(target)
         check_tls_certificate(target)
     if all_groups or "http" in only:
         check_http_security(target)
