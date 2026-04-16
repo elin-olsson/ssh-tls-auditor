@@ -96,6 +96,7 @@ scanme.nmap.org
 | SSH root login | `auth_none("root")` probe via paramiko | Server rejects root outright |
 | SSH password auth | `auth_password` probe with fake credentials | Server rejects password method |
 | SSH legacy detection | Banner + algorithm fingerprint against device DB | No known legacy device fingerprint |
+| CAA records | DNS lookup via `dnspython` | At least one CAA record present |
 | TLS versions | TLS handshake per version via `ssl` | 1.2/1.3 supported, 1.0/1.1 disabled |
 | TLS cipher suites | Handshake attempted with each weak cipher group | NULL, aNULL, EXPORT, RC4, 3DES all rejected |
 | TLS certificate trust | Full chain verification against system CA bundle | Issued by a trusted CA |
@@ -133,6 +134,8 @@ scanme.nmap.org
 A matched device is reported as `[INFO]` with a remediation note. If the device advertises **only** deprecated key exchange algorithms with no modern alternative, this is reported as `[FAIL]` — the session cannot be made secure regardless of client configuration.
 
 **TLS version check** — attempts a TLS handshake for each version in isolation by forcing both the minimum and maximum version on a fresh SSL context. This ensures only that specific version is negotiated, not the highest mutually supported one. TLS 1.2 and 1.3 are `[PASS]`. TLS 1.0 and 1.1 are `[FAIL]` — deprecated per RFC 8996 and disabled by default in modern browsers and libraries. If a version is not supported by the local Python/OpenSSL build (e.g. TLS 1.0 on hardened systems), the check is reported as `[INFO]`.
+
+**CAA record check** — performs a DNS CAA lookup for the target domain. A CAA record lists which certificate authorities are permitted to issue certificates for the domain — any CA not listed should refuse to issue. Missing CAA records are `[FAIL]`. Skipped for IP address targets.
 
 **TLS cipher suite check** — for each known weak cipher group (NULL, aNULL, EXPORT, RC4, 3DES), a fresh SSL context is created that allows *only* that group. If the server completes the handshake it is `[FAIL]` — the weak cipher is accepted. If it refuses, `[PASS]`. Groups not available in the local OpenSSL build are silently skipped.
 
@@ -315,5 +318,6 @@ Useful in CI/CD pipelines: the tool exits with code 1 if any `[FAIL]` result is 
 | Package | Version | Purpose |
 |---|---|---|
 | `paramiko` | >= 4.0.0 | SSH connection and algorithm enumeration |
+| `dnspython` | >= 2.0.0 | CAA DNS record lookup |
 | `ssl` | stdlib | TLS handshake testing |
 | `socket` | stdlib | Port connectivity checks |

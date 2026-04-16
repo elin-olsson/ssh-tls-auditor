@@ -38,6 +38,7 @@ import sys
 import threading
 import warnings
 
+import dns.resolver
 import paramiko
 import paramiko.message
 
@@ -809,6 +810,38 @@ def check_tls_versions(target: str) -> None:
             info(label, f"could not reach port 443 — {e}")
 
 
+def check_dns_caa(target: str) -> None:
+    """Check whether the target domain has CAA DNS records.
+
+    CAA (Certification Authority Authorization) records specify which CAs are
+    allowed to issue certificates for the domain. A missing CAA record means
+    any CA may issue a certificate — increasing the risk of misissued certs.
+
+    Skipped for IP addresses.
+    """
+    _thread_local.category = "DNS / CAA"
+    print("\n[DNS / CAA]")
+
+    if _is_ip(target):
+        info("CAA records", "skipped — target is an IP address")
+        return
+
+    try:
+        answers = dns.resolver.resolve(target, "CAA")
+        records = [str(r) for r in answers]
+        passed("CAA records", f"{len(records)} record(s): {', '.join(records)}")
+    except dns.resolver.NoAnswer:
+        failed(
+            "CAA records",
+            "no CAA records — any CA may issue certificates for this domain",
+            f'Add a CAA record. Example: {target} CAA 0 issue "letsencrypt.org"',
+        )
+    except dns.resolver.NXDOMAIN:
+        info("CAA records", "domain does not exist")
+    except dns.exception.DNSException as e:
+        info("CAA records", f"DNS lookup failed — {e}")
+
+
 def check_tls_ciphers(target: str) -> None:
     """Check whether port 443 accepts known weak cipher suites.
 
@@ -1322,6 +1355,7 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         check_ssh_password_auth(target)
         check_ssh_legacy(target)
     if all_groups or "tls" in only:
+        check_dns_caa(target)
         check_tls_versions(target)
         check_tls_ciphers(target)
         check_tls_certificate(target)
