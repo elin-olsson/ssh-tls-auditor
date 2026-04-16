@@ -73,6 +73,12 @@ python3 auditor.py example.com --quiet
 
 # Generate ready-to-paste config fixes for all failures
 python3 auditor.py example.com --config
+
+# Continuous monitoring — re-scan every 60 seconds, show only changes
+python3 auditor.py example.com --watch 60
+
+# Print a Markdown badge for each target
+python3 auditor.py example.com --badge
 ```
 
 ### Check groups (`--only`)
@@ -315,6 +321,50 @@ Output includes a timestamp and an array of result objects with `host`, `categor
 | `1` | One or more checks failed |
 
 Useful in CI/CD pipelines: the tool exits with code 1 if any `[FAIL]` result is found.
+
+### Severity levels and grading
+
+Every failed check is classified as either `[CRIT]` or `[WARN]`:
+
+| Tag | Colour | Examples |
+|---|---|---|
+| `[CRIT]` | Red | Broken ciphers, expired/untrusted cert, TLS 1.0/1.1, no modern KEX, password auth, root login, DSA host key, hostname mismatch |
+| `[WARN]` | Yellow | Weak algorithms alongside modern ones, missing security headers, HSTS issues, outdated OpenSSH, CAA/DNSSEC missing |
+
+Each host receives an **A–F grade** shown in the audit summary and HTML report:
+
+| Grade | Meaning |
+|---|---|
+| A | No failures |
+| B | Warnings only |
+| C | 1 critical failure |
+| D | 2–3 critical failures |
+| F | 4 or more critical failures |
+
+### Watch mode
+
+Use `--watch SECONDS` to continuously re-scan and show only what has changed:
+
+```bash
+python3 auditor.py example.com --watch 60
+```
+
+After each scan a diff is printed showing new failures and resolved issues. Press Ctrl+C to stop.
+
+### Badges
+
+Use `--badge` to generate a shields.io Markdown badge per target:
+
+```bash
+python3 auditor.py example.com --badge
+```
+
+Output:
+```
+![example.com](https://img.shields.io/badge/example.com-A-brightgreen)
+```
+
+Embed in a README to show the current security grade at a glance.
 
 ### Config generator
 
