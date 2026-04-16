@@ -63,6 +63,9 @@ python3 auditor.py example.com --only tls http
 # Adjust connection timeout (default: 5s)
 python3 auditor.py example.com --timeout 10
 python3 auditor.py -f hosts.txt --parallel --timeout 3
+
+# Only print failed checks (useful in CI/CD)
+python3 auditor.py example.com --quiet
 ```
 
 ### Check groups (`--only`)

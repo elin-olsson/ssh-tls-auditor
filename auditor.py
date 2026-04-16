@@ -21,6 +21,7 @@ Usage:
     python3 auditor.py example.com --json report.json
     python3 auditor.py -f hosts.txt --parallel --timeout 10
     python3 auditor.py example.com --only ssh tls
+    python3 auditor.py example.com --quiet
 """
 
 import argparse
@@ -73,6 +74,7 @@ class _ThreadLocalStdout:
 # ── Module-level configuration ─────────────────────────────────────────────────
 
 _timeout: int = 5
+_quiet:   bool = False
 CHECK_GROUPS = ("ports", "ssh", "tls", "http")
 
 # ANSI colour codes — only used when stdout is a real TTY
@@ -139,6 +141,8 @@ def _record(result: str, label: str, detail: str, remediation: str = "") -> None
 def passed(label: str, detail: str = "") -> None:
     _counts()["pass"] += 1
     _record("PASS", label, detail)
+    if _quiet:
+        return
     tag  = _colourise("[PASS]", _ANSI_GREEN)
     line = f"  {tag}  {label}"
     if detail:
@@ -158,6 +162,8 @@ def failed(label: str, detail: str = "", remediation: str = "") -> None:
 
 def info(label: str, detail: str = "") -> None:
     _record("INFO", label, detail)
+    if _quiet:
+        return
     tag  = _colourise("[INFO]", _ANSI_BLUE)
     line = f"  {tag}  {label}"
     if detail:
@@ -1486,10 +1492,15 @@ def main() -> None:
         "--parallel", action="store_true",
         help="scan multiple targets in parallel (default: sequential)",
     )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="only print FAIL results — suppress PASS and INFO",
+    )
     args = parser.parse_args()
 
-    global _timeout
+    global _timeout, _quiet
     _timeout = args.timeout
+    _quiet   = args.quiet
 
     only: set[str] | None = set(args.only) if args.only else None
 
