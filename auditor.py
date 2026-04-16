@@ -1621,6 +1621,28 @@ def print_multi_summary(targets: list[str]) -> None:
     print(f"╚{border}╝")
 
 
+# ── Progress bar ───────────────────────────────────────────────────────────────
+
+_progress_lock = threading.Lock()
+
+
+def _progress_bar(done: int, total: int, last: str) -> None:
+    """Print an in-place progress bar to stderr (only when stderr is a TTY)."""
+    if not sys.stderr.isatty():
+        return
+    width   = 30
+    filled  = int(width * done / total)
+    bar     = "█" * filled + "░" * (width - filled)
+    pct     = int(100 * done / total)
+    # Truncate host label so the line fits on one terminal line
+    label   = last[:30] if len(last) > 30 else last
+    sys.stderr.write(f"\r  Scanning [{bar}] {pct:3d}%  ({done}/{total}) — {label:<30}")
+    sys.stderr.flush()
+    if done == total:
+        sys.stderr.write("\r" + " " * 80 + "\r")
+        sys.stderr.flush()
+
+
 # ── Network range expansion ────────────────────────────────────────────────────
 
 def _expand_targets(raw: list[str]) -> list[str]:
@@ -1784,10 +1806,24 @@ def main() -> None:
     def _run_once() -> None:
         if args.parallel and len(targets) > 1:
             max_workers = min(len(targets), 20)
+            total       = len(targets)
+            done        = 0
+            outputs: dict[str, str] = {}
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(run_audit_buffered, t, only) for t in targets]
-                for future in futures:
-                    print(future.result(), end="")
+                future_to_target = {
+                    executor.submit(run_audit_buffered, t, only): t
+                    for t in targets
+                }
+                for future in concurrent.futures.as_completed(future_to_target):
+                    t = future_to_target[future]
+                    outputs[t] = future.result()
+                    done += 1
+                    with _progress_lock:
+                        _progress_bar(done, total, t)
+
+            for t in targets:
+                print(outputs[t], end="")
         else:
             for target in targets:
                 run_audit(target, only)
