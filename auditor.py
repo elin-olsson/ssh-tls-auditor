@@ -934,7 +934,14 @@ def check_tls_ciphers(target: str) -> None:
         "Apache: SSLCipherSuite 'ECDHE+AESGCM:ECDHE+CHACHA20'"
     )
 
-    reachable = True
+    # TLS 1.3 cipher suites are hardcoded and cannot be controlled via
+    # set_ciphers() — force TLS 1.2 for these tests so we only probe legacy
+    # cipher support. If the server has already dropped TLS 1.2 entirely, the
+    # weak cipher groups are irrelevant (TLS 1.3 ciphers are always strong).
+    tls12 = getattr(ssl.TLSVersion, "TLSv1_2", None)
+
+    reachable      = True
+    tls12_skipped  = False
     for label, cipher_str, description, sev in weak_groups:
         if not reachable:
             break
@@ -943,6 +950,8 @@ def check_tls_ciphers(target: str) -> None:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            if tls12:
+                ctx.maximum_version = tls12
             ctx.set_ciphers(cipher_str)
         except ssl.SSLError:
             continue  # cipher group not available in this OpenSSL build
@@ -953,7 +962,14 @@ def check_tls_ciphers(target: str) -> None:
                     negotiated = ssock.cipher()[0] if ssock.cipher() else "unknown"
                     failed(label, f"server accepted {negotiated} — {description}",
                            remediation, severity=sev)
-        except ssl.SSLError:
+        except ssl.SSLError as exc:
+            msg = str(exc).lower()
+            if "unsupported protocol" in msg or "no protocols available" in msg:
+                if not tls12_skipped:
+                    info("TLS cipher suite tests",
+                         "server does not support TLS 1.2 — TLS 1.3 ciphers are always strong, skipping")
+                    tls12_skipped = True
+                break
             passed(label, "not accepted by server")
         except (socket.timeout, ConnectionRefusedError, OSError) as e:
             info(label, f"could not reach port 443 — {e}")
