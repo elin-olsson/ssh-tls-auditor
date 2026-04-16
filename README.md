@@ -1,6 +1,6 @@
 ![SSH/TLS Auditor](github-banner.png)
 
-A command-line security audit tool that checks a target server for common SSH and TLS misconfigurations. All checks are implemented in pure Python — no external CLI tools required.
+A command-line security audit tool that checks a target server for common SSH and TLS misconfigurations. Implemented in Python with no external CLI tools required.
 
 ## Prerequisites
 
