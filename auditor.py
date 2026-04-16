@@ -74,6 +74,18 @@ class _ThreadLocalStdout:
 _timeout: int = 5
 CHECK_GROUPS = ("ports", "ssh", "tls", "http")
 
+# ANSI colour codes — only used when stdout is a real TTY
+_ANSI_GREEN  = "\033[32m"
+_ANSI_RED    = "\033[31m"
+_ANSI_BLUE   = "\033[34m"
+_ANSI_RESET  = "\033[0m"
+
+
+def _colourise(text: str, code: str) -> str:
+    if sys.stdout.isatty():
+        return f"{code}{text}{_ANSI_RESET}"
+    return text
+
 
 # ── Thread-local result tracking ───────────────────────────────────────────────
 
@@ -126,7 +138,8 @@ def _record(result: str, label: str, detail: str, remediation: str = "") -> None
 def passed(label: str, detail: str = "") -> None:
     _counts()["pass"] += 1
     _record("PASS", label, detail)
-    line = f"  [PASS]  {label}"
+    tag  = _colourise("[PASS]", _ANSI_GREEN)
+    line = f"  {tag}  {label}"
     if detail:
         line += f" — {detail}"
     print(line)
@@ -135,7 +148,8 @@ def passed(label: str, detail: str = "") -> None:
 def failed(label: str, detail: str = "", remediation: str = "") -> None:
     _counts()["fail"] += 1
     _record("FAIL", label, detail, remediation)
-    line = f"  [FAIL]  {label}"
+    tag  = _colourise("[FAIL]", _ANSI_RED)
+    line = f"  {tag}  {label}"
     if detail:
         line += f" — {detail}"
     print(line)
@@ -143,7 +157,8 @@ def failed(label: str, detail: str = "", remediation: str = "") -> None:
 
 def info(label: str, detail: str = "") -> None:
     _record("INFO", label, detail)
-    line = f"  [INFO]  {label}"
+    tag  = _colourise("[INFO]", _ANSI_BLUE)
+    line = f"  {tag}  {label}"
     if detail:
         line += f" — {detail}"
     print(line)
@@ -916,7 +931,7 @@ def check_tls_certificate(target: str) -> None:
 
 
 def check_http_security(target: str) -> None:
-    """Check HTTP→HTTPS redirect behaviour and HSTS header on port 443."""
+    """Check HTTP→HTTPS redirect behaviour, HSTS, and security headers on port 443."""
     _thread_local.category = "HTTP Security"
     print("\n[HTTP Security]")
 
@@ -955,50 +970,96 @@ def check_http_security(target: str) -> None:
         conn.request("HEAD", "/", headers={"Host": target,
                                            "User-Agent": "ssh-tls-auditor"})
         resp = conn.getresponse()
-        hsts = resp.getheader("Strict-Transport-Security", "")
+
+        hsts  = resp.getheader("Strict-Transport-Security", "")
+        xfo   = resp.getheader("X-Frame-Options", "")
+        xcto  = resp.getheader("X-Content-Type-Options", "")
+        csp   = resp.getheader("Content-Security-Policy", "")
         conn.close()
 
+        # ── HSTS ──────────────────────────────────────────────────────────────
         if not hsts:
             failed(
                 "HSTS header",
                 "Strict-Transport-Security not present",
                 "Add HSTS header. Nginx: add_header Strict-Transport-Security 'max-age=15552000; includeSubDomains' always;",
             )
-            return
+        else:
+            max_age: int | None = None
+            for part in hsts.split(";"):
+                part = part.strip()
+                if part.lower().startswith("max-age="):
+                    try:
+                        max_age = int(part.split("=", 1)[1])
+                    except ValueError:
+                        pass
 
-        max_age: int | None = None
-        for part in hsts.split(";"):
-            part = part.strip()
-            if part.lower().startswith("max-age="):
-                try:
-                    max_age = int(part.split("=", 1)[1])
-                except ValueError:
-                    pass
+            include_subdomains = "includesubdomains" in hsts.lower()
+            MIN_MAX_AGE = 15_552_000  # 180 days
 
-        include_subdomains = "includesubdomains" in hsts.lower()
-        MIN_MAX_AGE = 15_552_000  # 180 days
+            if max_age is None:
+                failed("HSTS header", f"present but max-age could not be parsed: {hsts}",
+                       "Fix the Strict-Transport-Security header format: max-age=15552000")
+            elif max_age < MIN_MAX_AGE:
+                days = max_age // 86400
+                failed(
+                    "HSTS header",
+                    f"max-age too short — {days} day(s) (minimum recommended: 180 days)",
+                    "Increase HSTS max-age to at least 15552000 (180 days).",
+                )
+            else:
+                days = max_age // 86400
+                detail = f"max-age={days} days"
+                if include_subdomains:
+                    detail += ", includeSubDomains"
+                passed("HSTS header", detail)
 
-        if max_age is None:
-            failed("HSTS header", f"present but max-age could not be parsed: {hsts}",
-                   "Fix the Strict-Transport-Security header format: max-age=15552000")
-        elif max_age < MIN_MAX_AGE:
-            days = max_age // 86400
+        # ── X-Frame-Options ───────────────────────────────────────────────────
+        if not xfo:
             failed(
-                "HSTS header",
-                f"max-age too short — {days} day(s) (minimum recommended: 180 days)",
-                "Increase HSTS max-age to at least 15552000 (180 days).",
+                "X-Frame-Options",
+                "header not present — site may be embeddable in iframes (clickjacking risk)",
+                "Add header. Nginx: add_header X-Frame-Options 'SAMEORIGIN' always;",
+            )
+        elif xfo.upper() in ("DENY", "SAMEORIGIN"):
+            passed("X-Frame-Options", xfo.upper())
+        else:
+            failed(
+                "X-Frame-Options",
+                f"unexpected value: {xfo}",
+                "Set X-Frame-Options to DENY or SAMEORIGIN.",
+            )
+
+        # ── X-Content-Type-Options ────────────────────────────────────────────
+        if not xcto:
+            failed(
+                "X-Content-Type-Options",
+                "header not present — browsers may MIME-sniff responses",
+                "Add header. Nginx: add_header X-Content-Type-Options 'nosniff' always;",
+            )
+        elif xcto.strip().lower() == "nosniff":
+            passed("X-Content-Type-Options", "nosniff")
+        else:
+            failed(
+                "X-Content-Type-Options",
+                f"unexpected value: {xcto}",
+                "Set X-Content-Type-Options to 'nosniff'.",
+            )
+
+        # ── Content-Security-Policy ───────────────────────────────────────────
+        if not csp:
+            failed(
+                "Content-Security-Policy",
+                "header not present — no CSP protection against XSS and injection attacks",
+                "Add a Content-Security-Policy header. Start with: default-src 'self'",
             )
         else:
-            days = max_age // 86400
-            detail = f"max-age={days} days"
-            if include_subdomains:
-                detail += ", includeSubDomains"
-            passed("HSTS header", detail)
+            passed("Content-Security-Policy", "present")
 
     except ConnectionRefusedError:
-        info("HSTS header", "port 443 closed — skipping")
+        info("HSTS / security headers", "port 443 closed — skipping")
     except (socket.timeout, OSError, ssl.SSLError) as e:
-        info("HSTS header", f"could not reach port 443 — {e}")
+        info("HSTS / security headers", f"could not reach port 443 — {e}")
 
 
 # ── TLS / hostname helpers ─────────────────────────────────────────────────────

@@ -102,6 +102,9 @@ scanme.nmap.org
 | TLS hostname match | SAN list (DNS + IP) checked against target | Certificate covers the target |
 | HTTP → HTTPS redirect | GET / on port 80, check for 3xx to https:// | Redirects to HTTPS |
 | HSTS header | HEAD / on port 443, parse `Strict-Transport-Security` | Present, max-age ≥ 180 days |
+| X-Frame-Options | HEAD / on port 443 | `DENY` or `SAMEORIGIN` |
+| X-Content-Type-Options | HEAD / on port 443 | `nosniff` |
+| Content-Security-Policy | HEAD / on port 443 | Present |
 
 **SSH algorithm check** — connects to port 22 and reads the full list of algorithms the server advertises in its KEXINIT message (key exchange, ciphers, MACs). Each is marked `[PASS]` if modern or `[FAIL]` if deprecated (e.g. `arcfour`, `3des-cbc`, `hmac-md5`).
 
@@ -136,10 +139,13 @@ A matched device is reported as `[INFO]` with a remediation note. If the device 
 - **Expiry** — the `notAfter` field is parsed and compared to today. Expired or expiring within 30 days is `[FAIL]`. Expiring within 90 days is `[INFO]` — a prompt to plan renewal. Valid beyond 90 days is `[PASS]`.
 - **Hostname match** — the certificate's Subject Alternative Names (SANs) are checked against the target. Both DNS names (with wildcard support) and IP addresses are handled. A mismatch is `[FAIL]`.
 
-**HTTP security check** — two checks covering the basics of secure HTTP configuration:
+**HTTP security check** — five checks covering the basics of secure HTTP configuration:
 
 - **HTTP → HTTPS redirect** — sends a `GET /` request on port 80 and checks for a 3xx redirect to an `https://` URL. A missing redirect means traffic can be intercepted in cleartext (`[FAIL]`).
 - **HSTS header** — sends a `HEAD /` request on port 443 and checks for a `Strict-Transport-Security` header. The `max-age` must be at least 180 days (15,552,000 seconds) to pass. HSTS tells browsers to always use HTTPS for the domain, preventing downgrade attacks.
+- **X-Frame-Options** — prevents the page from being embedded in an `<iframe>` on another origin. Missing or incorrect values leave the site open to clickjacking attacks. Accepted values: `DENY` or `SAMEORIGIN`.
+- **X-Content-Type-Options** — must be set to `nosniff` to prevent browsers from guessing the content type of a response. Without it, browsers may interpret non-script files as JavaScript and execute them.
+- **Content-Security-Policy** — restricts which resources (scripts, styles, images) the browser is allowed to load. Checked for presence only — a missing CSP means no protection against XSS and injection attacks.
 
 ## Example output
 
