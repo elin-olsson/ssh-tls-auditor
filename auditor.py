@@ -971,11 +971,14 @@ def check_tls_ciphers(target: str) -> None:
     print("\n[TLS Cipher Suites]")
 
     weak_groups = [
-        ("NULL ciphers",   "NULL",   "no encryption — data sent in cleartext",          "CRITICAL"),
-        ("aNULL ciphers",  "aNULL",  "anonymous auth — no server identity verification", "CRITICAL"),
-        ("EXPORT ciphers", "EXPORT", "export-grade 40/56-bit encryption — trivially broken", "CRITICAL"),
-        ("RC4 ciphers",    "RC4",    "RC4 stream cipher — cryptographically broken",    "CRITICAL"),
-        ("3DES ciphers",   "3DES",   "Triple DES — vulnerable to SWEET32 birthday attack", "WARNING"),
+        ("NULL ciphers",   "NULL",   "no encryption — data sent in cleartext",               "CRITICAL"),
+        ("aNULL ciphers",  "aNULL",  "anonymous auth — no server identity verification",      "CRITICAL"),
+        ("EXPORT ciphers", "EXPORT", "export-grade 40/56-bit encryption — trivially broken",  "CRITICAL"),
+        ("RC4 ciphers",    "RC4",    "RC4 stream cipher — cryptographically broken",          "CRITICAL"),
+        ("3DES ciphers",   "3DES",   "Triple DES — vulnerable to SWEET32 birthday attack",    "WARNING"),
+        ("DES ciphers",    "DES",    "single DES — 56-bit key, broken since 1999",            "CRITICAL"),
+        ("RC2 ciphers",    "RC2",    "RC2 cipher — deprecated, brute-forceable key schedule", "CRITICAL"),
+        ("IDEA ciphers",   "IDEA",   "IDEA cipher — removed from TLS 1.2, patent-encumbered", "WARNING"),
     ]
 
     remediation = (
@@ -1236,7 +1239,33 @@ def check_http_security(target: str) -> None:
                 detail = f"max-age={days} days"
                 if include_subdomains:
                     detail += ", includeSubDomains"
+                preload = "preload" in hsts.lower()
+                if preload:
+                    detail += ", preload"
                 passed("HSTS header", detail)
+
+                # ── HSTS preload list check ────────────────────────────────────
+                if not _is_ip(target) and include_subdomains and preload:
+                    # Check if domain is submitted to the HSTS preload list
+                    # by querying hstspreload.org API
+                    try:
+                        import urllib.request
+                        api_url = f"https://hstspreload.org/api/v2/status?domain={target}"
+                        with urllib.request.urlopen(api_url, timeout=_timeout) as r:
+                            data = json.loads(r.read().decode())
+                        status = data.get("status", "unknown")
+                        if status == "preloaded":
+                            passed("HSTS preload", f"{target} is on the preload list")
+                        elif status in ("pending", "submitted"):
+                            info("HSTS preload", f"submission {status} — not yet on the preload list")
+                        else:
+                            failed(
+                                "HSTS preload",
+                                f"header has 'preload' flag but domain is not submitted (status: {status})",
+                                f"Submit {target} at https://hstspreload.org/",
+                            )
+                    except Exception:
+                        pass  # preload check is best-effort, network may be unavailable
 
         # ── X-Frame-Options ───────────────────────────────────────────────────
         if not xfo:
@@ -1988,6 +2017,54 @@ def _sig_alg_from_der(der: bytes) -> str:
     return "unknown"
 
 
+def _rsa_key_bits_from_der(der: bytes) -> int | None:
+    """Extract RSA public key size in bits from a DER-encoded certificate.
+
+    Locates the rsaEncryption OID, then walks forward to find the BIT STRING
+    containing the RSAPublicKey SEQUENCE and reads the modulus length.
+    Returns None for non-RSA keys or if parsing fails.
+    """
+    rsa_oid_tlv = bytes([0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01])
+    pos = der.find(rsa_oid_tlv)
+    if pos == -1:
+        return None
+    search_start = pos + len(rsa_oid_tlv)
+    for i in range(search_start, min(search_start + 20, len(der) - 4)):
+        if der[i] != 0x03:
+            continue
+        length_byte = der[i + 1]
+        if length_byte & 0x80:
+            num_len_bytes = length_byte & 0x7f
+            bs_content_start = i + 2 + num_len_bytes
+        else:
+            bs_content_start = i + 2
+        if bs_content_start >= len(der) or der[bs_content_start] != 0x00:
+            continue
+        rsa_seq_start = bs_content_start + 1
+        if rsa_seq_start >= len(der) or der[rsa_seq_start] != 0x30:
+            continue
+        seq_len_byte = der[rsa_seq_start + 1]
+        if seq_len_byte & 0x80:
+            num_lb = seq_len_byte & 0x7f
+            mod_start = rsa_seq_start + 2 + num_lb
+        else:
+            mod_start = rsa_seq_start + 2
+        if mod_start >= len(der) or der[mod_start] != 0x02:
+            continue
+        mod_len_byte = der[mod_start + 1]
+        if mod_len_byte & 0x80:
+            num_lb = mod_len_byte & 0x7f
+            mod_len = int.from_bytes(der[mod_start + 2: mod_start + 2 + num_lb], "big")
+            mod_value_start = mod_start + 2 + num_lb
+        else:
+            mod_len = mod_len_byte
+            mod_value_start = mod_start + 2
+        if mod_value_start < len(der) and der[mod_value_start] == 0x00:
+            mod_len -= 1
+        return mod_len * 8
+    return None
+
+
 def check_tls_cert_signature(target: str) -> None:
     """Check the signature algorithm of the TLS certificate on port 443.
 
@@ -2036,6 +2113,18 @@ def check_tls_cert_signature(target: str) -> None:
     else:
         passed(f"Cert signature algorithm — {sig_alg}")
 
+    # ── RSA public key size ────────────────────────────────────────────────────
+    key_bits = _rsa_key_bits_from_der(cert_der)
+    if key_bits is not None:
+        if key_bits < 2048:
+            failed(
+                "Cert RSA key size",
+                f"RSA {key_bits}-bit public key — below recommended minimum of 2048 bits",
+                "Reissue the certificate with an RSA key of at least 2048 bits, or switch to ECDSA P-256.",
+                severity="CRITICAL",
+            )
+        else:
+            passed(f"Cert RSA key size — {key_bits}-bit")
 
 
 # ── Per-host audit ─────────────────────────────────────────────────────────────
