@@ -92,7 +92,7 @@ class _ThreadLocalStdout:
 _timeout: int = 5
 _quiet:   bool = False
 _config:  bool = False
-CHECK_GROUPS = ("ports", "ssh", "tls", "http", "smtp", "ftp", "rdp")
+CHECK_GROUPS = ("ports", "ssh", "tls", "http", "smtp", "ftp", "rdp", "email")
 
 # Best-practice algorithm lists used by the config generator.
 _SSH_BEST_KEX     = "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
@@ -956,6 +956,184 @@ def check_dns_dnssec(target: str) -> None:
         info("DNSSEC", "domain does not exist")
     except dns.exception.DNSException as e:
         info("DNSSEC", f"DNS lookup failed — {e}")
+
+
+def check_email_security(target: str) -> None:
+    """Check SPF, DKIM, and DMARC DNS records for the target domain.
+
+    SPF — looks for a v=spf1 TXT record at the domain root. Flags missing
+    records, permissive '+all' mechanisms, and multiple SPF records (RFC 7208
+    violation). A '~all' softfail is a WARNING; '-all' hardfail is PASS.
+
+    DKIM — queries a set of common selector names under _domainkey. Finding
+    at least one valid DKIM record is PASS. Reporting INFO when none of the
+    probed selectors match is expected for domains using non-standard names.
+
+    DMARC — looks up _dmarc.<domain>. Reports the policy level:
+      p=none      → WARN (monitoring only, no enforcement)
+      p=quarantine → PASS (suspicious mail goes to spam)
+      p=reject    → PASS (best practice, mail is discarded)
+
+    All three checks are skipped for IP address targets.
+    """
+    _thread_local.category = "Email Security"
+    print("\n[Email Security]")
+
+    if _is_ip(target):
+        info("Email security", "skipped — target is an IP address")
+        return
+
+    # ── SPF ───────────────────────────────────────────────────────────────────
+    try:
+        txt_records = []
+        try:
+            answers = dns.resolver.resolve(target, "TXT")
+            txt_records = [b"".join(r.strings).decode("utf-8", errors="replace")
+                           for r in answers]
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+            pass
+
+        spf_records = [t for t in txt_records if t.lower().startswith("v=spf1")]
+
+        if not spf_records:
+            failed(
+                "SPF record",
+                "no SPF record found — anyone can send mail as this domain",
+                f'Add a TXT record: {target} IN TXT "v=spf1 ... -all"',
+            )
+        elif len(spf_records) > 1:
+            failed(
+                "SPF record",
+                f"{len(spf_records)} SPF records found — RFC 7208 requires exactly one",
+                "Remove duplicate SPF records; keep only one v=spf1 TXT record.",
+                severity="WARNING",
+            )
+        else:
+            spf = spf_records[0]
+            spf_lower = spf.lower()
+            if "+all" in spf_lower:
+                failed(
+                    "SPF record",
+                    f"'+all' in SPF policy — any server may send mail as this domain: {spf}",
+                    "Replace '+all' with '-all' (hardfail) or '~all' (softfail).",
+                    severity="CRITICAL",
+                )
+            elif "~all" in spf_lower:
+                failed(
+                    "SPF record",
+                    f"SPF uses '~all' (softfail) — unauthenticated mail is accepted but marked: {spf}",
+                    "Consider upgrading to '-all' (hardfail) for stronger enforcement.",
+                    severity="WARNING",
+                )
+            elif "-all" in spf_lower or "?all" not in spf_lower:
+                passed("SPF record", spf)
+            else:
+                failed(
+                    "SPF record",
+                    f"SPF uses '?all' (neutral) — provides no protection: {spf}",
+                    "Replace '?all' with '-all' (hardfail).",
+                    severity="WARNING",
+                )
+    except dns.exception.DNSException as e:
+        info("SPF record", f"DNS lookup failed — {e}")
+
+    # ── DKIM ──────────────────────────────────────────────────────────────────
+    _DKIM_SELECTORS = [
+        "default", "google", "mail", "dkim", "k1", "k2",
+        "selector1", "selector2", "smtp", "email", "s1", "s2",
+    ]
+    dkim_found: list[str] = []
+    for selector in _DKIM_SELECTORS:
+        dkim_domain = f"{selector}._domainkey.{target}"
+        try:
+            answers = dns.resolver.resolve(dkim_domain, "TXT")
+            for r in answers:
+                val = b"".join(r.strings).decode("utf-8", errors="replace")
+                if "v=dkim1" in val.lower() or "p=" in val.lower():
+                    dkim_found.append(selector)
+                    break
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+                dns.exception.DNSException):
+            pass
+
+    if dkim_found:
+        passed("DKIM record", f"found at selector(s): {', '.join(dkim_found)}")
+    else:
+        info(
+            "DKIM record",
+            "no DKIM record found at common selectors — "
+            "domain may use a non-standard selector name, or DKIM is not configured",
+        )
+
+    # ── DMARC ─────────────────────────────────────────────────────────────────
+    dmarc_domain = f"_dmarc.{target}"
+    try:
+        answers = dns.resolver.resolve(dmarc_domain, "TXT")
+        dmarc_records = [
+            b"".join(r.strings).decode("utf-8", errors="replace")
+            for r in answers
+            if b"v=dmarc1" in b"".join(r.strings).lower()
+        ]
+
+        if not dmarc_records:
+            failed(
+                "DMARC record",
+                "no DMARC record found — phishing using this domain is not mitigated",
+                f'Add a TXT record at _dmarc.{target}: "v=DMARC1; p=reject; rua=mailto:dmarc@{target}"',
+            )
+        else:
+            dmarc = dmarc_records[0]
+            tags = {
+                kv.split("=", 1)[0].strip().lower(): kv.split("=", 1)[1].strip()
+                for kv in dmarc.split(";")
+                if "=" in kv
+            }
+            policy = tags.get("p", "none").lower()
+            pct    = tags.get("pct", "100")
+            rua    = tags.get("rua", "")
+
+            detail_parts = [f"p={policy}"]
+            if pct != "100":
+                detail_parts.append(f"pct={pct}%")
+            if rua:
+                detail_parts.append(f"rua={rua}")
+            detail = "; ".join(detail_parts)
+
+            if policy == "none":
+                failed(
+                    "DMARC policy",
+                    f"p=none — DMARC is in monitoring mode only, no enforcement: {detail}",
+                    f'Upgrade to p=quarantine or p=reject at _dmarc.{target}',
+                    severity="WARNING",
+                )
+            elif policy in ("quarantine", "reject"):
+                passed("DMARC policy", detail)
+            else:
+                failed(
+                    "DMARC policy",
+                    f"unknown DMARC policy '{policy}' — treating as unenforced: {detail}",
+                    f'Set p=quarantine or p=reject at _dmarc.{target}',
+                    severity="WARNING",
+                )
+
+            if not rua:
+                failed(
+                    "DMARC reporting",
+                    "no rua= tag — aggregate reports not configured",
+                    f'Add rua=mailto:dmarc@{target} to the DMARC record to receive reports.',
+                    severity="WARNING",
+                )
+            else:
+                passed("DMARC reporting", f"aggregate reports sent to {rua}")
+
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        failed(
+            "DMARC record",
+            "no DMARC record found — phishing using this domain is not mitigated",
+            f'Add a TXT record at _dmarc.{target}: "v=DMARC1; p=reject; rua=mailto:dmarc@{target}"',
+        )
+    except dns.exception.DNSException as e:
+        info("DMARC record", f"DNS lookup failed — {e}")
 
 
 def check_tls_ciphers(target: str) -> None:
@@ -2334,6 +2512,8 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         check_ftp(target)
     if all_groups or "rdp" in only:
         check_rdp(target)
+    if all_groups or "email" in only:
+        check_email_security(target)
 
     c     = _counts()
     total = c["pass"] + c["fail"]
