@@ -27,8 +27,8 @@ jobs:
       - name: Check syntax
         run: python3 -m py_compile auditor.py
 
-      - name: Verify import
-        run: python3 -c "import auditor"
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v
 
       - name: Verify CLI
         run: python3 auditor.py --help
