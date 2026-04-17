@@ -602,16 +602,19 @@ def check_ssh_host_keys(target: str) -> None:
 
 
 def check_ssh_root_login(target: str) -> None:
-    """Probe whether root login is enabled by sending a 'none' auth request.
+    """Probe whether root login is enabled via auth_none("root").
 
-    auth_none("root") asks the server to authenticate root using the 'none'
-    method (no credentials). Two distinct responses are possible:
+    OpenSSH responds to auth_none with the list of auth methods the server
+    would accept for that user. Two outcomes are possible:
 
-      BadAuthenticationType — server replied with a list of accepted methods.
-          Root login is enabled. [FAIL]
+      BadAuthenticationType — server acknowledged root and listed methods.
+        If "password" is in the list → CRIT (root login via password possible).
+        If only "publickey" is listed → WARN (root may be accessible via
+        pubkey; PermitRootLogin could be 'prohibit-password' or 'no' — the
+        SSH protocol does not expose which one, so manual verification is
+        recommended).
 
-      AuthenticationException — server rejected root outright.
-          Root login is likely disabled (PermitRootLogin no). [PASS]
+      AuthenticationException — server rejected root outright → PASS.
 
     Note: BadAuthenticationType is a subclass of AuthenticationException, so
     it must be caught first.
@@ -632,13 +635,22 @@ def check_ssh_root_login(target: str) -> None:
         )
 
     except paramiko.BadAuthenticationType as e:
-        methods = ", ".join(e.allowed_types) if e.allowed_types else "unknown"
-        failed(
-            "Root login",
-            f"enabled — server offered auth methods: {methods}",
-            "Set PermitRootLogin no in /etc/ssh/sshd_config and run: sudo systemctl reload sshd",
-            severity="CRITICAL",
-        )
+        methods = e.allowed_types or []
+        if "password" in methods:
+            failed(
+                "Root login",
+                f"enabled — server accepts password auth for root",
+                "Set PermitRootLogin no in /etc/ssh/sshd_config and run: sudo systemctl reload sshd",
+                severity="CRITICAL",
+            )
+        else:
+            failed(
+                "Root login",
+                f"possibly enabled — server offered methods: {', '.join(methods)} "
+                f"(PermitRootLogin may be 'prohibit-password' — verify manually)",
+                "Set PermitRootLogin no in /etc/ssh/sshd_config and run: sudo systemctl reload sshd",
+                severity="WARNING",
+            )
 
     except paramiko.AuthenticationException:
         passed("Root login", "disabled — server rejected auth for root")
