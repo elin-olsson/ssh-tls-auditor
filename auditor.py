@@ -1365,6 +1365,173 @@ def write_json(path: str) -> None:
     print(f"Results written to {path}")
 
 
+# ── Markdown export ────────────────────────────────────────────────────────────
+
+def write_markdown(path: str, targets: list[str]) -> None:
+    """Write a Markdown audit report grouped by host then category."""
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Group results by host → category
+    from collections import defaultdict
+    by_host: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for r in _results:
+        by_host[r["host"]][r["category"]].append(r)
+
+    _SEV_ICON = {"CRITICAL": "🔴", "WARNING": "🟡", "INFO": "🔵"}
+
+    lines: list[str] = [
+        "# SSH/TLS Audit Report",
+        "",
+        f"*Generated: {now}*",
+        "",
+    ]
+
+    for host in targets:
+        if host not in by_host:
+            continue
+        grade = compute_grade(host)
+        fail_count  = sum(1 for r in _results if r["host"] == host and r["result"] == "FAIL")
+        pass_count  = sum(1 for r in _results if r["host"] == host and r["result"] == "PASS")
+        lines += [
+            f"## {host}",
+            "",
+            f"**Grade:** {grade} &nbsp;|&nbsp; **Failures:** {fail_count} &nbsp;|&nbsp; **Passed:** {pass_count}",
+            "",
+        ]
+        for category, rows in by_host[host].items():
+            lines += [f"### {category}", ""]
+            fail_rows = [r for r in rows if r["result"] == "FAIL"]
+            pass_rows = [r for r in rows if r["result"] == "PASS"]
+            if fail_rows:
+                lines += ["| Severity | Check | Detail | Remediation |",
+                          "|----------|-------|--------|-------------|"]
+                for r in fail_rows:
+                    icon = _SEV_ICON.get(r["severity"], "")
+                    sev  = f"{icon} {r['severity']}"
+                    check = r["check"].replace("|", "\\|")
+                    detail = r["detail"].replace("|", "\\|")
+                    remed  = r["remediation"].replace("|", "\\|")
+                    lines.append(f"| {sev} | {check} | {detail} | {remed} |")
+                lines.append("")
+            if pass_rows:
+                lines.append("<details><summary>Passed checks</summary>")
+                lines.append("")
+                for r in pass_rows:
+                    lines.append(f"- ✅ {r['check']}")
+                lines += ["", "</details>", ""]
+
+    lines += ["---", f"*ssh-tls-auditor — {now}*", ""]
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    print(f"Results written to {path}")
+
+
+# ── Comparison report ─────────────────────────────────────────────────────────
+
+def compare_json_reports(before_path: str, after_path: str, out_path: str) -> None:
+    """Compare two JSON audit reports and write a Markdown diff.
+
+    Resolved failures (present in before, absent in after) are improvements.
+    New failures (absent in before, present in after) are regressions.
+    """
+    try:
+        with open(before_path, encoding="utf-8") as fh:
+            before_data = json.load(fh)
+        with open(after_path, encoding="utf-8") as fh:
+            after_data = json.load(fh)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        print(f"Error parsing JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    before_fails = {
+        (r["host"], r["category"], r["check"]): r
+        for r in before_data.get("results", [])
+        if r["result"] == "FAIL"
+    }
+    after_fails = {
+        (r["host"], r["category"], r["check"]): r
+        for r in after_data.get("results", [])
+        if r["result"] == "FAIL"
+    }
+
+    resolved   = {k: v for k, v in before_fails.items() if k not in after_fails}
+    regressions = {k: v for k, v in after_fails.items() if k not in before_fails}
+    unchanged  = {k: v for k, v in after_fails.items() if k in before_fails}
+
+    before_ts = before_data.get("generated", before_path)
+    after_ts  = after_data.get("generated",  after_path)
+
+    _SEV_ICON = {"CRITICAL": "🔴", "WARNING": "🟡", "INFO": "🔵"}
+
+    lines = [
+        "# Audit Comparison Report",
+        "",
+        f"| | |",
+        f"|---|---|",
+        f"| **Before** | {before_ts} |",
+        f"| **After**  | {after_ts} |",
+        "",
+        f"**{len(resolved)} resolved** &nbsp;|&nbsp; "
+        f"**{len(regressions)} new** &nbsp;|&nbsp; "
+        f"**{len(unchanged)} unchanged**",
+        "",
+    ]
+
+    if regressions:
+        lines += [
+            "## Regressions — new failures",
+            "",
+            "| Severity | Host | Category | Check | Detail |",
+            "|----------|------|----------|-------|--------|",
+        ]
+        for r in regressions.values():
+            icon = _SEV_ICON.get(r["severity"], "")
+            lines.append(
+                f"| {icon} {r['severity']} | {r['host']} | {r['category']} "
+                f"| {r['check']} | {r['detail']} |"
+            )
+        lines.append("")
+
+    if resolved:
+        lines += [
+            "## Improvements — resolved failures",
+            "",
+            "| Severity | Host | Category | Check |",
+            "|----------|------|----------|-------|",
+        ]
+        for r in resolved.values():
+            icon = _SEV_ICON.get(r["severity"], "")
+            lines.append(
+                f"| {icon} {r['severity']} | {r['host']} | {r['category']} | {r['check']} |"
+            )
+        lines.append("")
+
+    if unchanged:
+        lines += [
+            "<details><summary>Unchanged failures</summary>",
+            "",
+            "| Severity | Host | Category | Check |",
+            "|----------|------|----------|-------|",
+        ]
+        for r in unchanged.values():
+            icon = _SEV_ICON.get(r["severity"], "")
+            lines.append(
+                f"| {icon} {r['severity']} | {r['host']} | {r['category']} | {r['check']} |"
+            )
+        lines += ["", "</details>", ""]
+
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines += ["---", f"*ssh-tls-auditor comparison — {now}*", ""]
+
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    print(f"Comparison report written to {out_path}")
+
+
 # ── HTML export ────────────────────────────────────────────────────────────────
 
 _HTML_CSS = """
@@ -2344,8 +2511,10 @@ def main() -> None:
             "  auditor.py host1 host2 host3 --csv results.csv\n"
             "  auditor.py example.com --html report.html\n"
             "  auditor.py example.com --json report.json\n"
+            "  auditor.py example.com --markdown report.md\n"
             "  auditor.py -f hosts.txt --parallel --timeout 10\n"
-            "  auditor.py example.com --only ssh tls"
+            "  auditor.py example.com --only ssh tls\n"
+            "  auditor.py --compare before.json after.json diff.md"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2368,6 +2537,14 @@ def main() -> None:
     parser.add_argument(
         "--json", metavar="FILE",
         help="write results to a JSON file",
+    )
+    parser.add_argument(
+        "--markdown", metavar="FILE",
+        help="write results to a Markdown report",
+    )
+    parser.add_argument(
+        "--compare", nargs=3, metavar=("BEFORE", "AFTER", "OUT"),
+        help="compare two JSON reports and write a Markdown diff (no scan needed)",
     )
     parser.add_argument(
         "--timeout", type=int, default=5, metavar="SECONDS",
@@ -2398,6 +2575,11 @@ def main() -> None:
         help="re-scan every SECONDS and show what changed (Ctrl+C to stop)",
     )
     args = parser.parse_args()
+
+    # --compare runs standalone — no scan needed
+    if args.compare:
+        compare_json_reports(args.compare[0], args.compare[1], args.compare[2])
+        sys.exit(0)
 
     global _timeout, _quiet, _config
     _timeout = args.timeout
@@ -2503,6 +2685,9 @@ def main() -> None:
 
     if args.json:
         write_json(args.json)
+
+    if args.markdown:
+        write_markdown(args.markdown, targets)
 
     if args.badge:
         print("\nMarkdown badges:")
