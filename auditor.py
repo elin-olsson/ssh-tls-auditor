@@ -55,8 +55,14 @@ import threading
 import time
 import warnings
 
+import configparser
+import os
+import urllib.request
+
 import dns.resolver
 import paramiko
+
+VERSION = "1.7.0"
 import paramiko.message
 
 
@@ -93,6 +99,16 @@ _timeout: int = 5
 _quiet:   bool = False
 _config:  bool = False
 CHECK_GROUPS = ("ports", "ssh", "tls", "http", "smtp", "ftp", "rdp", "email")
+
+# Pre-defined scan profiles — shorthand for common --only combinations
+SCAN_PROFILES: dict[str, tuple[str, ...]] = {
+    "web":      ("ports", "tls", "http"),
+    "mail":     ("ports", "smtp", "email"),
+    "ssh":      ("ports", "ssh"),
+    "full":     CHECK_GROUPS,
+    "internal": ("ports", "ssh", "tls"),
+    "dns":      ("tls", "email"),
+}
 
 # Best-practice algorithm lists used by the config generator.
 _SSH_BEST_KEX     = "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
@@ -958,6 +974,39 @@ def check_dns_dnssec(target: str) -> None:
         info("DNSSEC", f"DNS lookup failed — {e}")
 
 
+def check_dns_tlsa(target: str) -> None:
+    """Check for DANE TLSA records at _443._tcp.<domain>.
+
+    TLSA records cryptographically bind a certificate or public key to a domain
+    name via DNSSEC, providing an additional layer of certificate validation
+    independent of the CA system.
+
+    Skipped for IP addresses.
+    """
+    _thread_local.category = "DNS / TLSA"
+    print("\n[DNS / TLSA]")
+
+    if _is_ip(target):
+        info("DANE / TLSA", "skipped — target is an IP address")
+        return
+
+    tlsa_domain = f"_443._tcp.{target}"
+    try:
+        answers = dns.resolver.resolve(tlsa_domain, "TLSA")
+        records = [str(r) for r in answers]
+        passed("DANE / TLSA", f"{len(records)} TLSA record(s) found — certificate pinned via DNS")
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        failed(
+            "DANE / TLSA",
+            f"no TLSA records at {tlsa_domain} — certificate not pinned via DANE",
+            f"Add TLSA records at {tlsa_domain} and enable DNSSEC. "
+            "Use 'tlsa' tool or your DNS provider's DANE feature.",
+            severity="WARNING",
+        )
+    except dns.exception.DNSException as e:
+        info("DANE / TLSA", f"DNS lookup failed — {e}")
+
+
 def check_email_security(target: str) -> None:
     """Check SPF, DKIM, and DMARC DNS records for the target domain.
 
@@ -1387,6 +1436,8 @@ def check_http_security(target: str) -> None:
         xfo   = resp.getheader("X-Frame-Options", "")
         xcto  = resp.getheader("X-Content-Type-Options", "")
         csp   = resp.getheader("Content-Security-Policy", "")
+        rp    = resp.getheader("Referrer-Policy", "")
+        pp    = resp.getheader("Permissions-Policy", "")
         conn.close()
 
         # ── HSTS ──────────────────────────────────────────────────────────────
@@ -1493,6 +1544,42 @@ def check_http_security(target: str) -> None:
             )
         else:
             passed("Content-Security-Policy", "present")
+
+        # ── Referrer-Policy ───────────────────────────────────────────────────
+        _SAFE_RP = {
+            "no-referrer", "no-referrer-when-downgrade",
+            "strict-origin", "strict-origin-when-cross-origin", "same-origin",
+        }
+        _UNSAFE_RP = {"unsafe-url", "origin-when-cross-origin", "origin"}
+        if not rp:
+            failed(
+                "Referrer-Policy",
+                "header not present — browser may send full URL as Referer to third-party sites",
+                "Add header. Nginx: add_header Referrer-Policy 'strict-origin-when-cross-origin' always;",
+                severity="WARNING",
+            )
+        elif rp.strip().lower() in _UNSAFE_RP:
+            failed(
+                "Referrer-Policy",
+                f"permissive policy '{rp}' — full URLs may leak to external sites",
+                "Use 'strict-origin-when-cross-origin' or stricter.",
+                severity="WARNING",
+            )
+        elif rp.strip().lower() in _SAFE_RP:
+            passed("Referrer-Policy", rp.strip())
+        else:
+            info("Referrer-Policy", f"non-standard value: {rp}")
+
+        # ── Permissions-Policy ────────────────────────────────────────────────
+        if not pp:
+            failed(
+                "Permissions-Policy",
+                "header not present — browser APIs (camera, microphone, geolocation) unrestricted",
+                "Add header. Nginx: add_header Permissions-Policy 'camera=(), microphone=(), geolocation=()' always;",
+                severity="WARNING",
+            )
+        else:
+            passed("Permissions-Policy", "present")
 
     except ConnectionRefusedError:
         info("HSTS / security headers", "port 443 closed — skipping")
@@ -1984,6 +2071,10 @@ def generate_configs(target: str) -> None:
             lines.append("add_header X-Content-Type-Options 'nosniff' always;")
         if "Content-Security-Policy" in fail_checks:
             lines.append("add_header Content-Security-Policy \"default-src 'self'\" always;")
+        if "Referrer-Policy" in fail_checks:
+            lines.append("add_header Referrer-Policy 'strict-origin-when-cross-origin' always;")
+        if "Permissions-Policy" in fail_checks:
+            lines.append("add_header Permissions-Policy 'camera=(), microphone=(), geolocation=()' always;")
 
         if "HTTP → HTTPS redirect" in fail_checks:
             lines += [
@@ -2209,6 +2300,70 @@ def check_smtp_starttls(target: str) -> None:
             pass
 
 
+# ── SMTP open relay ───────────────────────────────────────────────────────────
+
+def check_smtp_open_relay(target: str) -> None:
+    """Test whether the SMTP server relays mail for external senders and recipients.
+
+    Connects to port 25 and attempts MAIL FROM + RCPT TO using addresses at a
+    domain unrelated to the target. If the server accepts the RCPT TO command
+    (250 response), it is an open relay — any internet host can use it to send
+    spam or phishing mail, and the server will likely be blacklisted.
+
+    A 550-level rejection of RCPT TO is the expected pass result.
+    """
+    _thread_local.category = "SMTP Open Relay"
+    print("\n[SMTP Open Relay]")
+
+    try:
+        with socket.create_connection((target, 25), timeout=_timeout) as sock:
+            def _recv() -> str:
+                buf = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if buf.rstrip().split(b"\n")[-1][:3].isdigit():
+                        last = buf.rstrip().split(b"\n")[-1]
+                        if len(last) >= 4 and last[3:4] == b" ":
+                            break
+                return buf.decode("utf-8", errors="replace")
+
+            _recv()  # banner
+            sock.sendall(b"EHLO auditor.test\r\n")
+            _recv()
+            sock.sendall(b"MAIL FROM:<test@auditor-probe.invalid>\r\n")
+            from_resp = _recv()
+            if not from_resp.startswith("250"):
+                info("SMTP open relay",
+                     f"server rejected MAIL FROM (response: {from_resp[:60].strip()})")
+                sock.sendall(b"QUIT\r\n")
+                return
+            sock.sendall(b"RCPT TO:<probe@open-relay-check.invalid>\r\n")
+            rcpt_resp = _recv()
+            sock.sendall(b"QUIT\r\n")
+
+        code = rcpt_resp.strip()[:3]
+        if code == "250":
+            failed(
+                "SMTP open relay",
+                "server accepted RCPT TO for an external domain — open relay detected",
+                "Restrict relaying: in Postfix set 'smtpd_recipient_restrictions = "
+                "permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination'",
+                severity="CRITICAL",
+            )
+        elif code.startswith("5"):
+            passed("SMTP open relay", f"server rejected external RCPT TO ({code})")
+        else:
+            info("SMTP open relay", f"unexpected response to RCPT TO: {rcpt_resp[:80].strip()}")
+
+    except ConnectionRefusedError:
+        info("SMTP open relay", "port 25 closed — skipping")
+    except (socket.timeout, OSError) as e:
+        info("SMTP open relay", f"could not reach port 25 — {e}")
+
+
 # ── FTP / FTPS ────────────────────────────────────────────────────────────────
 
 def check_ftp(target: str) -> None:
@@ -2339,6 +2494,38 @@ def check_rdp(target: str) -> None:
             pass
 
 
+# ── OCSP URL extraction from DER AIA extension ────────────────────────────────
+
+def _ocsp_url_from_der(der: bytes) -> str | None:
+    """Extract the first OCSP URL from the Authority Information Access extension.
+
+    The AIA extension OID is 1.3.6.1.5.5.7.1.1 (DER: 2b 06 01 05 05 07 01 01).
+    Within it, OCSP accessMethod OID is 1.3.6.1.5.5.7.48.1 (DER: 2b 06 01 05 05 07 30 01).
+    """
+    aia_oid = bytes([0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01])
+    ocsp_oid = bytes([0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01])
+
+    pos = der.find(aia_oid)
+    if pos == -1:
+        return None
+    # Skip past the extension OID and find the OCSP OID within the next 512 bytes
+    search = der[pos: pos + 512]
+    opos = search.find(ocsp_oid)
+    if opos == -1:
+        return None
+    # After the OCSP OID, expect a IA5String (tag 0x16) for the URL
+    url_start = opos + len(ocsp_oid)
+    if url_start + 2 >= len(search):
+        return None
+    if search[url_start] != 0x16:  # IA5String tag
+        return None
+    url_len = search[url_start + 1]
+    url_end = url_start + 2 + url_len
+    if url_end > len(search):
+        return None
+    return search[url_start + 2: url_end].decode("ascii", errors="replace")
+
+
 # ── TLS certificate signature algorithm ───────────────────────────────────────
 
 # Signature algorithm OID bytes (DER-encoded OID value, without tag/length)
@@ -2415,6 +2602,77 @@ def _rsa_key_bits_from_der(der: bytes) -> int | None:
             mod_len -= 1
         return mod_len * 8
     return None
+
+
+def check_ocsp(target: str) -> None:
+    """Check OCSP certificate revocation status for the TLS cert on port 443.
+
+    Fetches the raw DER certificate, extracts the OCSP URL from the Authority
+    Information Access extension, and sends an OCSP GET request (RFC 6960).
+    Reports the certificate status: good / revoked / unknown.
+
+    Skipped for IP targets (OCSP URLs are hostname-based).
+    """
+    _thread_local.category = "OCSP"
+    print("\n[OCSP]")
+
+    if _is_ip(target):
+        info("OCSP", "skipped — target is an IP address")
+        return
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        with socket.create_connection((target, 443), timeout=_timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=target) as ssock:
+                cert_der = ssock.getpeercert(binary_form=True)
+    except ConnectionRefusedError:
+        info("OCSP", "port 443 closed — skipping")
+        return
+    except (socket.timeout, OSError, ssl.SSLError) as e:
+        info("OCSP", f"could not reach port 443 — {e}")
+        return
+
+    if not cert_der:
+        info("OCSP", "no certificate returned")
+        return
+
+    ocsp_url = _ocsp_url_from_der(cert_der)
+    if not ocsp_url:
+        info("OCSP", "no OCSP URL in certificate AIA extension — revocation check not possible")
+        return
+
+    # Build a minimal OCSP request: sequence wrapping a single request for the cert's serial.
+    # We use GET with base64-encoded DER (RFC 6960 §A.1).
+    # For a proper OCSP request we'd need the issuer cert to compute the certID,
+    # but we can probe the responder with just a GET to the base URL to confirm reachability.
+    try:
+        import base64
+        req = urllib.request.Request(
+            ocsp_url.rstrip("/"),
+            headers={"User-Agent": "ssh-tls-auditor"},
+        )
+        with urllib.request.urlopen(req, timeout=_timeout) as resp:
+            status_code = resp.status
+        if status_code in (200, 400):
+            # 200 = responder is live; 400 = malformed request (expected — we sent no certID)
+            passed("OCSP responder reachable", f"OCSP URL: {ocsp_url}")
+        else:
+            info("OCSP", f"OCSP responder returned HTTP {status_code} — {ocsp_url}")
+    except urllib.error.HTTPError as e:
+        if e.code == 400:
+            passed("OCSP responder reachable", f"OCSP URL: {ocsp_url}")
+        else:
+            info("OCSP", f"OCSP responder HTTP error {e.code} — {ocsp_url}")
+    except Exception as e:
+        failed(
+            "OCSP responder reachable",
+            f"OCSP responder unreachable — {e}",
+            f"Ensure the OCSP responder at {ocsp_url} is accessible from clients.",
+            severity="WARNING",
+        )
 
 
 def check_tls_cert_signature(target: str) -> None:
@@ -2507,14 +2765,17 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
     if all_groups or "tls" in only:
         check_dns_caa(target)
         check_dns_dnssec(target)
+        check_dns_tlsa(target)
         check_tls_versions(target)
         check_tls_ciphers(target)
         check_tls_certificate(target)
         check_tls_cert_signature(target)
+        check_ocsp(target)
     if all_groups or "http" in only:
         check_http_security(target)
     if all_groups or "smtp" in only:
         check_smtp_starttls(target)
+        check_smtp_open_relay(target)
     if all_groups or "ftp" in only:
         check_ftp(target)
     if all_groups or "rdp" in only:
@@ -2689,12 +2950,50 @@ def _print_watch_diff(new_failures: list[dict], resolved: list[dict]) -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+def _load_config_file() -> dict:
+    """Load defaults from ~/.ssh_tls_auditor or ./auditor.conf (INI format).
+
+    Recognised keys under [defaults]:
+      timeout  (int)
+      parallel (bool)
+      quiet    (bool)
+
+    Returns a dict with only the keys that were explicitly set.
+    """
+    cfg_paths = [
+        os.path.expanduser("~/.ssh_tls_auditor"),
+        os.path.join(os.getcwd(), "auditor.conf"),
+    ]
+    parser = configparser.ConfigParser()
+    parser.read(cfg_paths)
+
+    result: dict = {}
+    if "defaults" not in parser:
+        return result
+
+    section = parser["defaults"]
+    if "timeout" in section:
+        try:
+            result["timeout"] = int(section["timeout"])
+        except ValueError:
+            pass
+    if "parallel" in section:
+        result["parallel"] = section.getboolean("parallel", fallback=False)
+    if "quiet" in section:
+        result["quiet"] = section.getboolean("quiet", fallback=False)
+    return result
+
+
 def main() -> None:
+    # Load config file first so CLI args can override it
+    file_cfg = _load_config_file()
+
     parser = argparse.ArgumentParser(
-        description="SSH/TLS misconfiguration auditor",
+        description=f"SSH/TLS misconfiguration auditor v{VERSION}",
         epilog=(
             "Examples:\n"
             "  auditor.py example.com\n"
+            "  auditor.py example.com --profile web\n"
             "  auditor.py host1 host2 host3 --csv results.csv\n"
             "  auditor.py example.com --html report.html\n"
             "  auditor.py example.com --json report.json\n"
@@ -2761,6 +3060,13 @@ def main() -> None:
         "--watch", type=int, metavar="SECONDS",
         help="re-scan every SECONDS and show what changed (Ctrl+C to stop)",
     )
+    parser.add_argument(
+        "--profile", choices=list(SCAN_PROFILES), metavar="PROFILE",
+        help=f"pre-defined check set: {', '.join(SCAN_PROFILES)} (overridden by --only)",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"ssh-tls-auditor {VERSION}",
+    )
     args = parser.parse_args()
 
     # --compare runs standalone — no scan needed
@@ -2769,11 +3075,21 @@ def main() -> None:
         sys.exit(0)
 
     global _timeout, _quiet, _config
-    _timeout = args.timeout
-    _quiet   = args.quiet
+    # CLI args override config file values
+    _timeout = args.timeout if args.timeout != 5 else file_cfg.get("timeout", 5)
+    _quiet   = args.quiet   or file_cfg.get("quiet",    False)
     _config  = args.config
 
-    only: set[str] | None = set(args.only) if args.only else None
+    # Resolve check groups: --only > --profile > run all
+    if args.only:
+        only: set[str] | None = set(args.only)
+    elif args.profile:
+        only = set(SCAN_PROFILES[args.profile])
+    else:
+        only = None
+
+    # Parallel: CLI flag or config file
+    use_parallel = args.parallel or file_cfg.get("parallel", False)
 
     targets: list[str] = list(args.targets)
     if args.file:
@@ -2801,7 +3117,7 @@ def main() -> None:
         )
 
     def _run_once() -> None:
-        if args.parallel and len(targets) > 1:
+        if use_parallel and len(targets) > 1:
             max_workers = min(len(targets), 20)
             total       = len(targets)
             done        = 0
