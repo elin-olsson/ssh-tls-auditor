@@ -1,42 +1,36 @@
 #!/usr/bin/env python3
 """
-ssh-tls-auditor — SSH and TLS misconfiguration auditor
+ssh-tls-auditor v1.7.0 — SSH and TLS misconfiguration auditor
 
-Checks one or more target servers for:
-  - Open ports (22, 80, 443)
-  - SSH algorithms (key exchange, ciphers, MACs)
-  - SSH banner / server version
-  - SSH host key type and size
-  - SSH root login status
-  - SSH password authentication
-  - SSH legacy hardware detection (HP iLO, Cisco, Dropbear, etc.)
-  - CAA DNS records and DNSSEC
-  - TLS version support (1.0, 1.1, 1.2, 1.3)
-  - TLS cipher suites (NULL, aNULL, EXPORT, RC4, 3DES)
-  - TLS certificate (trust, expiry, hostname match)
-  - HTTP → HTTPS redirect, HSTS, and security headers (X-Frame-Options, X-Content-Type-Options, CSP)
-  - SMTP STARTTLS / implicit TLS, weak ciphers, and certificate expiry (ports 25, 587, 465)
-  - FTP detection and AUTH TLS support (port 21)
-  - RDP detection and NLA requirement (port 3389)
-  - SSH banner OS/distro information disclosure
-  - TLS certificate signature algorithm (SHA-1, MD5)
+Check groups (--only / --profile):
+  ports   Open ports (22, 80, 443)
+  ssh     SSH algorithms, banner/version, host key, root login, password auth,
+          OS/distro disclosure, legacy device fingerprinting
+  tls     CAA, DNSSEC, DANE/TLSA, TLS versions, cipher suites,
+          certificate (trust/expiry/hostname/signature/RSA key size), OCSP
+  http    HTTP→HTTPS redirect, HSTS (+ preload), X-Frame-Options,
+          X-Content-Type-Options, CSP, Referrer-Policy, Permissions-Policy
+  smtp    STARTTLS support, weak SMTP ciphers, certificate validity, open relay
+  ftp     AUTH TLS support (port 21)
+  rdp     NLA requirement (port 3389)
+  email   SPF, DKIM (common selectors), DMARC (policy + reporting)
+
+Profiles: --profile web | mail | ssh | full | internal | dns
 
 Each failed check is classified as [CRIT] or [WARN]. Each host receives an A–F grade.
 
 Usage:
     python3 auditor.py <target> [<target> ...]
-    python3 auditor.py -f hosts.txt
-    python3 auditor.py example.com 192.168.1.10 --csv report.csv
+    python3 auditor.py -f hosts.txt --parallel
+    python3 auditor.py example.com --profile web
+    python3 auditor.py example.com --only ssh tls
     python3 auditor.py example.com --html report.html
     python3 auditor.py example.com --json report.json
-    python3 auditor.py -f hosts.txt --parallel --timeout 10
-    python3 auditor.py example.com --only ssh tls
-    python3 auditor.py example.com --quiet
+    python3 auditor.py example.com --markdown report.md
+    python3 auditor.py --compare before.json after.json diff.md
     python3 auditor.py example.com --config
     python3 auditor.py example.com --watch 60
-    python3 auditor.py example.com --badge
     python3 auditor.py 192.168.1.0/24 --parallel --only ssh
-    python3 auditor.py mail.example.com --only smtp
 """
 
 import argparse
@@ -1546,6 +1540,8 @@ def check_http_security(target: str) -> None:
             passed("Content-Security-Policy", "present")
 
         # ── Referrer-Policy ───────────────────────────────────────────────────
+        # The header may contain a comma-separated fallback list (RFC 8942 §8.1).
+        # Browsers use the last value they understand, so we evaluate the last token.
         _SAFE_RP = {
             "no-referrer", "no-referrer-when-downgrade",
             "strict-origin", "strict-origin-when-cross-origin", "same-origin",
@@ -1558,17 +1554,20 @@ def check_http_security(target: str) -> None:
                 "Add header. Nginx: add_header Referrer-Policy 'strict-origin-when-cross-origin' always;",
                 severity="WARNING",
             )
-        elif rp.strip().lower() in _UNSAFE_RP:
-            failed(
-                "Referrer-Policy",
-                f"permissive policy '{rp}' — full URLs may leak to external sites",
-                "Use 'strict-origin-when-cross-origin' or stricter.",
-                severity="WARNING",
-            )
-        elif rp.strip().lower() in _SAFE_RP:
-            passed("Referrer-Policy", rp.strip())
         else:
-            info("Referrer-Policy", f"non-standard value: {rp}")
+            # Evaluate the last token in a potentially comma-separated list
+            effective = rp.split(",")[-1].strip().lower()
+            if effective in _UNSAFE_RP:
+                failed(
+                    "Referrer-Policy",
+                    f"permissive policy '{effective}' (from: {rp}) — full URLs may leak to external sites",
+                    "Use 'strict-origin-when-cross-origin' or stricter.",
+                    severity="WARNING",
+                )
+            elif effective in _SAFE_RP:
+                passed("Referrer-Policy", rp.strip())
+            else:
+                info("Referrer-Policy", f"unrecognised value: {rp}")
 
         # ── Permissions-Policy ────────────────────────────────────────────────
         if not pp:
@@ -2513,11 +2512,12 @@ def _ocsp_url_from_der(der: bytes) -> str | None:
     opos = search.find(ocsp_oid)
     if opos == -1:
         return None
-    # After the OCSP OID, expect a IA5String (tag 0x16) for the URL
+    # After the OCSP OID, the URL is encoded as GeneralName uniformResourceIdentifier:
+    # [6] IMPLICIT IA5String → context-specific primitive tag 6 = 0x86
     url_start = opos + len(ocsp_oid)
     if url_start + 2 >= len(search):
         return None
-    if search[url_start] != 0x16:  # IA5String tag
+    if search[url_start] != 0x86:  # [6] IMPLICIT (context-specific, primitive, tag 6)
         return None
     url_len = search[url_start + 1]
     url_end = url_start + 2 + url_len

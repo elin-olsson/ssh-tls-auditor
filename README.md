@@ -66,6 +66,13 @@ python3 auditor.py -f hosts.txt --parallel
 python3 auditor.py example.com --only ssh
 python3 auditor.py example.com --only tls http
 
+# Use a pre-defined scan profile
+python3 auditor.py example.com --profile web
+python3 auditor.py mail.example.com --profile mail
+
+# Print the current version
+python3 auditor.py --version
+
 # Adjust connection timeout (default: 5s)
 python3 auditor.py example.com --timeout 10
 python3 auditor.py -f hosts.txt --parallel --timeout 3
@@ -92,12 +99,24 @@ python3 auditor.py example.com --badge
 | Group | Checks included |
 |---|---|
 | `ports` | Port 22, 80, 443 |
-| `ssh` | SSH algorithms, banner/version, host key type, root login, password auth, legacy detection |
-| `tls` | TLS versions, cipher suites, certificate trust/expiry/hostname/signature/key size |
-| `http` | HTTP → HTTPS redirect, HSTS (incl. preload), X-Frame-Options, X-Content-Type-Options, CSP |
-| `smtp` | STARTTLS support, weak SMTP ciphers, SMTP certificate validity |
+| `ssh` | SSH algorithms, banner/version, host key type, root login, password auth, legacy detection, OS/distro disclosure |
+| `tls` | CAA, DNSSEC, DANE/TLSA, TLS versions, cipher suites, certificate (trust/expiry/hostname/signature/key size), OCSP |
+| `http` | HTTP → HTTPS redirect, HSTS (incl. preload), X-Frame-Options, X-Content-Type-Options, CSP, Referrer-Policy, Permissions-Policy |
+| `smtp` | STARTTLS support, weak SMTP ciphers, SMTP certificate validity, open relay test |
 | `ftp` | FTP AUTH TLS support |
 | `rdp` | RDP NLA (Network Level Authentication) |
+| `email` | SPF, DKIM (common selectors), DMARC policy and reporting |
+
+### Scan profiles (`--profile`)
+
+| Profile | Groups included |
+|---|---|
+| `web` | ports, tls, http |
+| `mail` | ports, smtp, email |
+| `ssh` | ports, ssh |
+| `internal` | ports, ssh, tls |
+| `dns` | tls, email |
+| `full` | all groups |
 
 ### hosts.txt format
 
@@ -130,16 +149,24 @@ scanme.nmap.org
 | TLS hostname match | SAN list (DNS + IP) checked against target | Certificate covers the target |
 | TLS cert signature algorithm | DER OID scan of raw certificate | SHA-256 or better (SHA-1 / MD5 = CRITICAL) |
 | TLS cert RSA key size | DER modulus length parsed from raw certificate | RSA ≥ 2048-bit (or non-RSA key) |
+| DANE / TLSA | DNS TLSA lookup at `_443._tcp.<domain>` | TLSA records present |
+| OCSP | OCSP URL extracted from cert AIA extension; responder probed | Responder reachable |
 | HTTP → HTTPS redirect | GET / on port 80, check for 3xx to https:// | Redirects to HTTPS |
 | HSTS header | HEAD / on port 443, parse `Strict-Transport-Security` | Present, max-age ≥ 180 days, on preload list |
 | X-Frame-Options | HEAD / on port 443 | `DENY` or `SAMEORIGIN` |
 | X-Content-Type-Options | HEAD / on port 443 | `nosniff` |
 | Content-Security-Policy | HEAD / on port 443 | Present |
+| Referrer-Policy | HEAD / on port 443 | Safe policy (e.g. `strict-origin-when-cross-origin`) |
+| Permissions-Policy | HEAD / on port 443 | Header present |
 | SMTP STARTTLS | EHLO + STARTTLS probe on port 25/587 | STARTTLS advertised and completes successfully |
 | SMTP cipher suites | TLS handshake with weak-only context over STARTTLS | Same weak groups as TLS check |
 | SMTP certificate | Chain verification + expiry after STARTTLS | Trusted and not expiring |
+| SMTP open relay | MAIL FROM + RCPT TO with external addresses on port 25 | Server rejects external recipients |
 | FTP AUTH TLS | Connect port 21, send AUTH TLS | Server accepts AUTH TLS |
 | RDP NLA | X.224 Connection Request PDU to port 3389 | Server requires Network Level Authentication |
+| SPF | TXT lookup at domain root for `v=spf1` | `-all` hardfail present |
+| DKIM | TXT lookup at common `_domainkey` selectors | At least one valid DKIM record found |
+| DMARC | TXT lookup at `_dmarc.<domain>` | `p=quarantine` or `p=reject` with `rua=` |
 
 **SSH algorithm check** — connects to port 22 and reads the full list of algorithms the server advertises in its KEXINIT message (key exchange, ciphers, MACs). Each is marked `[PASS]` if modern or `[FAIL]` if deprecated (e.g. `arcfour`, `3des-cbc`, `hmac-md5`).
 
@@ -178,13 +205,15 @@ A matched device is reported as `[INFO]` with a remediation note. If the device 
 - **Expiry** — the `notAfter` field is parsed and compared to today. Expired or expiring within 30 days is `[FAIL]`. Expiring within 90 days is `[INFO]` — a prompt to plan renewal. Valid beyond 90 days is `[PASS]`.
 - **Hostname match** — the certificate's Subject Alternative Names (SANs) are checked against the target. Both DNS names (with wildcard support) and IP addresses are handled. A mismatch is `[FAIL]`.
 
-**HTTP security check** — five checks covering the basics of secure HTTP configuration:
+**HTTP security check** — seven checks covering the basics of secure HTTP configuration:
 
 - **HTTP → HTTPS redirect** — sends a `GET /` request on port 80 and checks for a 3xx redirect to an `https://` URL. A missing redirect means traffic can be intercepted in cleartext (`[FAIL]`).
 - **HSTS header** — sends a `HEAD /` request on port 443 and checks for a `Strict-Transport-Security` header. The `max-age` must be at least 180 days (15,552,000 seconds) to pass. If the header is present and valid, the tool also queries the [hstspreload.org](https://hstspreload.org) API to check whether the domain is on the browser preload list — domains on the list are protected from the very first visit, before any HSTS header has been seen. HSTS prevents downgrade attacks and cookie hijacking over plain HTTP.
 - **X-Frame-Options** — prevents the page from being embedded in an `<iframe>` on another origin. Missing or incorrect values leave the site open to clickjacking attacks. Accepted values: `DENY` or `SAMEORIGIN`.
 - **X-Content-Type-Options** — must be set to `nosniff` to prevent browsers from guessing the content type of a response. Without it, browsers may interpret non-script files as JavaScript and execute them.
 - **Content-Security-Policy** — restricts which resources (scripts, styles, images) the browser is allowed to load. Checked for presence only — a missing CSP means no protection against XSS and injection attacks.
+- **Referrer-Policy** — controls how much of the current URL is sent as `Referer` to third-party sites. Unsafe values (`unsafe-url`, `origin-when-cross-origin`, `origin`) leak full URLs or origins to external parties. Recommended: `strict-origin-when-cross-origin` or stricter. Multi-value headers are supported — the last value is evaluated as per the spec.
+- **Permissions-Policy** — restricts access to browser APIs (camera, microphone, geolocation, etc.). Checked for presence only — a missing header means all APIs are unrestricted.
 
 **TLS certificate signature algorithm check** — fetches the raw DER-encoded certificate from port 443 (without verifying the chain) and scans the OID bytes to identify the signature algorithm. SHA-1 and MD5 signed certificates are `[FAIL]` (`CRITICAL`) — both are cryptographically broken and rejected by modern browsers. SHA-256 and stronger are `[PASS]`. The check runs without any external dependencies by scanning known OID byte sequences directly in the DER data.
 
@@ -195,6 +224,18 @@ A matched device is reported as `[INFO]` with a remediation note. If the device 
 **FTP AUTH TLS check** — connects to port 21 and attempts to upgrade the connection by sending `AUTH TLS`. If the server responds with `234`, TLS is supported (`[PASS]`). If the command is rejected or the port is closed, it is `[FAIL]` — file transfers would be sent in cleartext.
 
 **RDP NLA check** — sends an X.224 Connection Request PDU to port 3389 with the `PROTOCOL_SSL | PROTOCOL_HYBRID` flags, requesting Network Level Authentication. If the server's response includes `PROTOCOL_HYBRID` in the selected protocols, NLA is required (`[PASS]`). Without NLA, the Windows login screen is presented before authentication — exposing it to credential-spraying attacks and unpatched pre-auth RDP vulnerabilities.
+
+**DANE/TLSA check** — queries DNS for TLSA records at `_443._tcp.<domain>`. TLSA records cryptographically bind a certificate or public key to a domain name via DNSSEC, providing an additional layer of certificate validation independent of the CA system. Missing TLSA records are `[WARN]` — DANE is optional but provides defence-in-depth against mis-issued certificates.
+
+**OCSP check** — extracts the OCSP responder URL from the certificate's Authority Information Access (AIA) extension by parsing the raw DER. Makes an HTTP probe to the responder to confirm it is reachable. An unreachable OCSP responder means clients may not be able to verify certificate revocation status (`[WARN]`). Skipped for IP targets and certificates without an AIA extension.
+
+**SMTP open relay check** — connects to port 25 and attempts to relay a message from an external sender (`test@auditor-probe.invalid`) to an external recipient (`probe@open-relay-check.invalid`). If the server accepts the `RCPT TO` command with a 250 response, it is an open relay (`CRITICAL`) — it can be abused to send spam and is likely to be blacklisted. A 5xx rejection is the expected pass result.
+
+**SPF check** — looks up `TXT` records at the domain root for a `v=spf1` record. Evaluates the `all` mechanism: `-all` (hardfail) is `[PASS]`, `~all` (softfail) is `[WARN]`, `+all` (allow all) is `[CRITICAL]`, `?all` (neutral) or missing `all` is `[WARN]`. Multiple SPF records are flagged — RFC 7208 requires exactly one.
+
+**DKIM check** — probes 12 common DKIM selector names (`default`, `google`, `mail`, `dkim`, `selector1`, `selector2`, etc.) under `_domainkey.<domain>`. Reports `[PASS]` if any valid DKIM record is found. Reports `[INFO]` if none match — the domain may use a non-standard selector name that cannot be enumerated externally.
+
+**DMARC check** — looks up `TXT` records at `_dmarc.<domain>`. Reports the policy: `p=none` is `[WARN]` (monitoring only, no enforcement), `p=quarantine` or `p=reject` is `[PASS]`. Also checks for the `rua=` aggregate reporting tag — missing `rua=` means you receive no reports about forged mail using your domain.
 
 ## Example output
 
@@ -427,6 +468,35 @@ python3 auditor.py example.com --config
 ```
 
 After the audit summary, the tool prints a targeted `sshd_config` section and/or an nginx server block containing only the lines needed to fix the detected issues — weak algorithm lists, missing security headers, redirect rules, and so on. Nothing is written to disk; output goes to stdout so you can review before applying.
+
+### Scan profiles
+
+Use `--profile` to run a pre-defined set of check groups without having to list them with `--only`:
+
+```bash
+python3 auditor.py example.com --profile web
+python3 auditor.py mail.example.com --profile mail
+```
+
+`--only` always takes precedence over `--profile` if both are specified.
+
+### Version
+
+```bash
+python3 auditor.py --version
+# ssh-tls-auditor 1.7.0
+```
+
+### Configuration file
+
+Default settings can be stored in `~/.ssh_tls_auditor` or `./auditor.conf` (INI format). CLI flags take precedence over the config file.
+
+```ini
+[defaults]
+timeout  = 10
+parallel = true
+quiet    = false
+```
 
 ## Output legend
 
