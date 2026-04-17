@@ -15,6 +15,7 @@ Checks one or more target servers for:
   - TLS cipher suites (NULL, aNULL, EXPORT, RC4, 3DES)
   - TLS certificate (trust, expiry, hostname match)
   - HTTP → HTTPS redirect, HSTS, and security headers (X-Frame-Options, X-Content-Type-Options, CSP)
+  - SMTP STARTTLS / implicit TLS, weak ciphers, and certificate expiry (ports 25, 587, 465)
 
 Each failed check is classified as [CRIT] or [WARN]. Each host receives an A–F grade.
 
@@ -31,6 +32,7 @@ Usage:
     python3 auditor.py example.com --watch 60
     python3 auditor.py example.com --badge
     python3 auditor.py 192.168.1.0/24 --parallel --only ssh
+    python3 auditor.py mail.example.com --only smtp
 """
 
 import argparse
@@ -86,7 +88,7 @@ class _ThreadLocalStdout:
 _timeout: int = 5
 _quiet:   bool = False
 _config:  bool = False
-CHECK_GROUPS = ("ports", "ssh", "tls", "http")
+CHECK_GROUPS = ("ports", "ssh", "tls", "http", "smtp")
 
 # Best-practice algorithm lists used by the config generator.
 _SSH_BEST_KEX     = "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
@@ -1576,6 +1578,235 @@ def generate_configs(target: str) -> None:
         _config_block("nginx config", lines)
 
 
+# ── SMTP / STARTTLS ────────────────────────────────────────────────────────────
+
+_SMTP_PORTS = [25, 587, 465]
+
+# Weak cipher strings to test over TLS 1.2 on the SMTP connection
+_SMTP_WEAK_CIPHERS = {
+    "NULL":   "NULL",
+    "aNULL":  "aNULL",
+    "EXPORT": "EXPORT",
+    "RC4":    "RC4",
+    "3DES":   "3DES",
+}
+
+
+def _smtp_connect(host: str, port: int, use_ssl: bool, timeout: int):
+    """Return a connected socket (plain or wrapped), or None on failure."""
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return None
+
+    if use_ssl:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            return ctx.wrap_socket(sock, server_hostname=host)
+        except ssl.SSLError:
+            sock.close()
+            return None
+
+    # Read the greeting line
+    try:
+        sock.recv(1024)
+    except OSError:
+        sock.close()
+        return None
+    return sock
+
+
+def _smtp_starttls(sock, host: str, timeout: int):
+    """Send EHLO + STARTTLS and return an upgraded SSL socket, or None."""
+    try:
+        sock.sendall(f"EHLO auditor\r\n".encode())
+        sock.recv(4096)
+        sock.sendall(b"STARTTLS\r\n")
+        resp = sock.recv(1024).decode(errors="replace")
+        if not resp.startswith("220"):
+            return None
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx.wrap_socket(sock, server_hostname=host)
+    except (OSError, ssl.SSLError):
+        return None
+
+
+def check_smtp_starttls(target: str) -> None:
+    """Check SMTP servers on ports 25/587/465 for STARTTLS support and weak TLS."""
+    _thread_local.category = "SMTP/STARTTLS"
+    print("\n[SMTP/STARTTLS]")
+
+    reachable_ports: list[int] = []
+    for port in _SMTP_PORTS:
+        try:
+            with socket.create_connection((target, port), timeout=_timeout):
+                reachable_ports.append(port)
+        except OSError:
+            pass
+
+    if not reachable_ports:
+        print("  (no SMTP ports open — skipping)")
+        return
+
+    for port in reachable_ports:
+        use_implicit_ssl = port == 465
+        label = f"port {port}"
+
+        # ── STARTTLS / implicit TLS availability ──────────────────────────────
+        if use_implicit_ssl:
+            sock = _smtp_connect(target, port, use_ssl=True, timeout=_timeout)
+            if sock is None:
+                failed(
+                    f"Implicit TLS ({label})",
+                    "Could not complete TLS handshake on port 465.",
+                    "Ensure the MTA is configured for implicit TLS (SMTPS) on port 465.",
+                    severity="CRITICAL",
+                )
+                continue
+            tls_sock = sock
+            passed(f"Implicit TLS ({label})")
+        else:
+            plain_sock = _smtp_connect(target, port, use_ssl=False, timeout=_timeout)
+            if plain_sock is None:
+                continue
+            tls_sock = _smtp_starttls(plain_sock, target, timeout=_timeout)
+            if tls_sock is None:
+                failed(
+                    f"STARTTLS ({label})",
+                    "Server did not offer or complete STARTTLS.",
+                    "Enable STARTTLS on the mail server (Postfix: starttls_enable=yes).",
+                    severity="CRITICAL",
+                )
+                plain_sock.close()
+                continue
+            passed(f"STARTTLS ({label})")
+
+        # ── TLS version ───────────────────────────────────────────────────────
+        negotiated = tls_sock.version()
+        if negotiated in ("TLSv1", "TLSv1.1"):
+            failed(
+                f"TLS version ({label})",
+                f"Negotiated {negotiated} — deprecated protocol.",
+                "Configure the MTA to require TLS 1.2 or higher.",
+                severity="CRITICAL",
+            )
+        else:
+            passed(f"TLS version ({label}) — {negotiated}")
+        tls_sock.close()
+
+        # ── Weak ciphers (force TLS 1.2 to avoid TLS 1.3 cipher lock-in) ────
+        for cipher_name, cipher_str in _SMTP_WEAK_CIPHERS.items():
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            try:
+                ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+            except AttributeError:
+                pass
+            try:
+                ctx.set_ciphers(cipher_str)
+            except ssl.SSLError:
+                continue
+
+            try:
+                raw = socket.create_connection((target, port), timeout=_timeout)
+                if not use_implicit_ssl:
+                    # STARTTLS upgrade before wrapping
+                    raw.recv(1024)
+                    raw.sendall(b"EHLO auditor\r\n")
+                    raw.recv(4096)
+                    raw.sendall(b"STARTTLS\r\n")
+                    resp = raw.recv(1024).decode(errors="replace")
+                    if not resp.startswith("220"):
+                        raw.close()
+                        continue
+                wrapped = ctx.wrap_socket(raw, server_hostname=target)
+                wrapped.close()
+                failed(
+                    f"Weak cipher {cipher_name} ({label})",
+                    f"Server accepted {cipher_name} cipher suite.",
+                    "Restrict MTA cipher list to AES-GCM and ChaCha20.",
+                    severity="CRITICAL",
+                )
+            except (ssl.SSLError, OSError):
+                passed(f"Weak cipher {cipher_name} rejected ({label})")
+
+        # ── Certificate expiry ────────────────────────────────────────────────
+        ctx_cert = ssl.create_default_context()
+        ctx_cert.check_hostname = False
+        ctx_cert.verify_mode = ssl.CERT_NONE
+        try:
+            raw = socket.create_connection((target, port), timeout=_timeout)
+            if not use_implicit_ssl:
+                raw.recv(1024)
+                raw.sendall(b"EHLO auditor\r\n")
+                raw.recv(4096)
+                raw.sendall(b"STARTTLS\r\n")
+                resp = raw.recv(1024).decode(errors="replace")
+                if not resp.startswith("220"):
+                    raw.close()
+                    raise OSError("STARTTLS rejected")
+            cert_sock = ctx_cert.wrap_socket(raw, server_hostname=target)
+            cert_der = cert_sock.getpeercert(binary_form=True)
+            cert_sock.close()
+            if cert_der:
+                cert = ssl.DER_cert_to_PEM_cert(cert_der)
+                # Parse expiry via a temporary context that validates dates
+                try:
+                    exp_str = cert_sock.getpeercert().get("notAfter", "") if hasattr(cert_sock, "getpeercert") else ""
+                except Exception:
+                    exp_str = ""
+                # Re-fetch the parsed cert
+                raw2 = socket.create_connection((target, port), timeout=_timeout)
+                ctx2 = ssl.create_default_context()
+                ctx2.check_hostname = False
+                ctx2.verify_mode = ssl.CERT_NONE
+                if not use_implicit_ssl:
+                    raw2.recv(1024)
+                    raw2.sendall(b"EHLO auditor\r\n")
+                    raw2.recv(4096)
+                    raw2.sendall(b"STARTTLS\r\n")
+                    resp2 = raw2.recv(1024).decode(errors="replace")
+                    if resp2.startswith("220"):
+                        sock2 = ctx2.wrap_socket(raw2, server_hostname=target)
+                    else:
+                        raw2.close()
+                        sock2 = None
+                else:
+                    sock2 = ctx2.wrap_socket(raw2, server_hostname=target)
+
+                if sock2:
+                    parsed = sock2.getpeercert()
+                    sock2.close()
+                    if parsed:
+                        not_after = parsed.get("notAfter", "")
+                        if not_after:
+                            exp_dt = datetime.datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+                            days_left = (exp_dt - datetime.datetime.utcnow()).days
+                            if days_left < 0:
+                                failed(
+                                    f"SMTP cert expired ({label})",
+                                    f"Certificate expired {abs(days_left)} day(s) ago.",
+                                    "Renew the TLS certificate on the mail server.",
+                                    severity="CRITICAL",
+                                )
+                            elif days_left < 30:
+                                failed(
+                                    f"SMTP cert expiry ({label})",
+                                    f"Certificate expires in {days_left} day(s).",
+                                    "Renew the TLS certificate on the mail server.",
+                                    severity="WARNING",
+                                )
+                            else:
+                                passed(f"SMTP cert expiry ({label}) — {days_left} days left")
+        except (OSError, ssl.SSLError):
+            pass
+
+
 # ── Per-host audit ─────────────────────────────────────────────────────────────
 
 def run_audit(target: str, only: set[str] | None = None) -> None:
@@ -1609,6 +1840,8 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         check_tls_certificate(target)
     if all_groups or "http" in only:
         check_http_security(target)
+    if all_groups or "smtp" in only:
+        check_smtp_starttls(target)
 
     c     = _counts()
     total = c["pass"] + c["fail"]
