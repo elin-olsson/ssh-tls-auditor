@@ -16,6 +16,10 @@ Checks one or more target servers for:
   - TLS certificate (trust, expiry, hostname match)
   - HTTP → HTTPS redirect, HSTS, and security headers (X-Frame-Options, X-Content-Type-Options, CSP)
   - SMTP STARTTLS / implicit TLS, weak ciphers, and certificate expiry (ports 25, 587, 465)
+  - FTP detection and AUTH TLS support (port 21)
+  - RDP detection and NLA requirement (port 3389)
+  - SSH banner OS/distro information disclosure
+  - TLS certificate signature algorithm (SHA-1, MD5)
 
 Each failed check is classified as [CRIT] or [WARN]. Each host receives an A–F grade.
 
@@ -88,7 +92,7 @@ class _ThreadLocalStdout:
 _timeout: int = 5
 _quiet:   bool = False
 _config:  bool = False
-CHECK_GROUPS = ("ports", "ssh", "tls", "http", "smtp")
+CHECK_GROUPS = ("ports", "ssh", "tls", "http", "smtp", "ftp", "rdp")
 
 # Best-practice algorithm lists used by the config generator.
 _SSH_BEST_KEX     = "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
@@ -542,6 +546,30 @@ def check_ssh_banner(target: str) -> None:
         )
     else:
         passed("OpenSSH version", f"{raw} — current")
+
+    # ── Banner information leakage ─────────────────────────────────────────
+    # The SSH banner is sent in cleartext before auth and can reveal OS/distro
+    # information useful to an attacker (e.g. "Ubuntu-2ubuntu0.1").
+    os_hint = ""
+    after_version = banner.split("OpenSSH_")[1] if "OpenSSH_" in banner else banner
+    # Distro tokens typically follow the version after a space or dash
+    tokens = after_version.split()
+    if len(tokens) > 1:
+        os_hint = " ".join(tokens[1:])
+    elif "-" in after_version.split()[0]:
+        parts = after_version.split()[0].split("-", 1)
+        if len(parts) > 1:
+            os_hint = parts[1]
+
+    if os_hint:
+        failed(
+            "SSH banner OS disclosure",
+            f"banner reveals OS/distro info: '{os_hint}'",
+            "Set 'DebianBanner no' (Debian/Ubuntu) or remove distro patch to suppress OS info from banner.",
+            severity="WARNING",
+        )
+    else:
+        passed("SSH banner", "no OS/distro info disclosed in banner")
 
 
 def check_ssh_host_keys(target: str) -> None:
@@ -1800,6 +1828,216 @@ def check_smtp_starttls(target: str) -> None:
             pass
 
 
+# ── FTP / FTPS ────────────────────────────────────────────────────────────────
+
+def check_ftp(target: str) -> None:
+    """Check whether FTP (port 21) is open and if explicit TLS (AUTH TLS) is supported."""
+    _thread_local.category = "FTP"
+    print("\n[FTP]")
+
+    try:
+        with socket.create_connection((target, 21), timeout=_timeout) as sock:
+            banner = sock.recv(1024).decode(errors="replace").strip()
+    except OSError:
+        print("  (port 21 closed — skipping)")
+        return
+
+    # Port is open — flag it as informational and check for AUTH TLS
+    info("FTP port 21", f"open — banner: {banner[:80]}")
+    failed(
+        "FTP enabled",
+        "Port 21 (FTP) is open — FTP transmits credentials in plaintext",
+        "Disable FTP and use SFTP (SSH) or FTPS. If FTP is required, enforce AUTH TLS.",
+        severity="CRITICAL",
+    )
+
+    # Check whether the server supports AUTH TLS (explicit FTPS)
+    try:
+        with socket.create_connection((target, 21), timeout=_timeout) as sock:
+            sock.recv(1024)  # banner
+            sock.sendall(b"AUTH TLS\r\n")
+            resp = sock.recv(1024).decode(errors="replace").strip()
+            if resp.startswith("234"):
+                passed("AUTH TLS", "server supports explicit FTPS (AUTH TLS)")
+            else:
+                failed(
+                    "AUTH TLS",
+                    f"server rejected AUTH TLS — response: {resp[:80]}",
+                    "Configure the FTP server to support AUTH TLS (explicit FTPS).",
+                    severity="CRITICAL",
+                )
+    except OSError:
+        info("AUTH TLS", "could not re-connect to test AUTH TLS")
+
+
+# ── RDP ───────────────────────────────────────────────────────────────────────
+
+# RDP security protocol identifiers in the X.224 Connection Confirm PDU
+_RDP_PROTOCOL_STANDARD = 0   # Classic RDP security (no NLA, no TLS)
+_RDP_PROTOCOL_TLS       = 1   # TLS only
+_RDP_PROTOCOL_NLA       = 3   # TLS + NLA (CredSSP)
+_RDP_PROTOCOL_NLA_EAP   = 11  # TLS + NLA + EAP
+
+
+def check_rdp(target: str) -> None:
+    """Check whether RDP (port 3389) is open and whether NLA is required.
+
+    Sends an X.224 Connection Request PDU requesting NLA (protocol 3).
+    The server's X.224 Connection Confirm PDU reveals which security
+    protocol it actually selected:
+      - 0 → classic RDP security (no NLA, no TLS) → CRIT
+      - 1 → TLS without NLA → WARN
+      - 3 or 11 → NLA required → PASS
+    """
+    _thread_local.category = "RDP"
+    print("\n[RDP]")
+
+    try:
+        sock = socket.create_connection((target, 3389), timeout=_timeout)
+    except OSError:
+        print("  (port 3389 closed — skipping)")
+        return
+
+    info("RDP port 3389", "open")
+    failed(
+        "RDP exposed",
+        "Port 3389 (RDP) is reachable — RDP should not be exposed to untrusted networks",
+        "Restrict RDP access with a firewall or VPN. Never expose RDP directly to the internet.",
+        severity="WARNING",
+    )
+
+    # X.224 Connection Request requesting negotiatedProtocol = NLA (3)
+    # TPKT header (4) + X.224 CR PDU
+    x224_cr = (
+        b"\x03\x00\x00\x13"   # TPKT: version 3, length 19
+        b"\x0e"                # X.224 length indicator
+        b"\xe0"                # X.224 Connection Request
+        b"\x00\x00"            # DST-REF
+        b"\x00\x00"            # SRC-REF
+        b"\x00"                # CLASS
+        # RDP Negotiation Request (type=1, flags=0, length=8, requestedProtocols=3)
+        b"\x01\x00\x08\x00"
+        b"\x03\x00\x00\x00"
+    )
+
+    try:
+        sock.sendall(x224_cr)
+        resp = sock.recv(1024)
+        sock.close()
+
+        # X.224 Connection Confirm starts at byte 5 (after TPKT header + LI)
+        # Negotiation Response is at offset 11: type(1), flags(1), length(2), selectedProtocol(4)
+        if len(resp) >= 19 and resp[11] == 0x02:  # type 2 = Negotiation Response
+            protocol = int.from_bytes(resp[15:19], "little")
+            if protocol in (_RDP_PROTOCOL_NLA, _RDP_PROTOCOL_NLA_EAP):
+                passed("RDP NLA", "Network Level Authentication required")
+            elif protocol == _RDP_PROTOCOL_TLS:
+                failed(
+                    "RDP NLA",
+                    "TLS negotiated but NLA not required — credentials sent after session setup",
+                    "Enable Network Level Authentication: Group Policy → Require NLA.",
+                    severity="WARNING",
+                )
+            else:
+                failed(
+                    "RDP NLA",
+                    "classic RDP security selected — no TLS, no NLA",
+                    "Enable NLA and TLS in RDP settings. Disable classic RDP security.",
+                    severity="CRITICAL",
+                )
+        elif len(resp) >= 12 and resp[11] == 0x03:  # type 3 = Negotiation Failure
+            info("RDP NLA", "server returned negotiation failure — may require specific TLS version")
+        else:
+            info("RDP NLA", "could not parse negotiation response")
+    except OSError as e:
+        info("RDP NLA", f"could not complete negotiation — {e}")
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+# ── TLS certificate signature algorithm ───────────────────────────────────────
+
+# Signature algorithm OID bytes (DER-encoded OID value, without tag/length)
+_SIG_ALG_OIDS: dict[bytes, str] = {
+    bytes([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x04]): "md5WithRSAEncryption",
+    bytes([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05]): "sha1WithRSAEncryption",
+    bytes([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]): "sha256WithRSAEncryption",
+    bytes([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c]): "sha384WithRSAEncryption",
+    bytes([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d]): "sha512WithRSAEncryption",
+    bytes([0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]):        "ecdsa-with-SHA256",
+    bytes([0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03]):        "ecdsa-with-SHA384",
+    bytes([0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04]):        "ecdsa-with-SHA512",
+}
+
+
+def _sig_alg_from_der(der: bytes) -> str:
+    """Extract the outer signature algorithm name from a DER-encoded certificate.
+
+    Scans for known OID byte sequences. The outer signatureAlgorithm field
+    (second top-level element) holds the same OID as the TBSCertificate's
+    inner signature field — we match whichever appears first.
+    """
+    for oid_bytes, name in _SIG_ALG_OIDS.items():
+        # DER OID tag is 0x06, followed by length byte, followed by OID value
+        needle = bytes([0x06, len(oid_bytes)]) + oid_bytes
+        if needle in der:
+            return name
+    return "unknown"
+
+
+def check_tls_cert_signature(target: str) -> None:
+    """Check the signature algorithm of the TLS certificate on port 443.
+
+    SHA-1-signed certificates are deprecated and flagged as CRITICAL.
+    MD5-signed certificates are flagged as CRITICAL.
+    """
+    _thread_local.category = "TLS Cert Signature"
+    print("\n[TLS Cert Signature]")
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        with socket.create_connection((target, 443), timeout=_timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=target) as ssock:
+                cert_der = ssock.getpeercert(binary_form=True)
+    except OSError:
+        print("  (port 443 closed — skipping)")
+        return
+    except ssl.SSLError as e:
+        info("TLS cert signature", f"could not connect — {e}")
+        return
+
+    if not cert_der:
+        info("TLS cert signature", "no certificate returned")
+        return
+
+    sig_alg = _sig_alg_from_der(cert_der)
+    sig_alg_lower = sig_alg.lower()
+
+    if "md5" in sig_alg_lower:
+        failed(
+            "Cert signature algorithm",
+            f"signed with {sig_alg} — MD5 is cryptographically broken",
+            "Reissue the certificate with SHA-256 or stronger signature algorithm.",
+            severity="CRITICAL",
+        )
+    elif "sha1" in sig_alg_lower:
+        failed(
+            "Cert signature algorithm",
+            f"signed with {sig_alg} — SHA-1 is deprecated since 2017",
+            "Reissue the certificate with SHA-256 or stronger signature algorithm.",
+            severity="CRITICAL",
+        )
+    else:
+        passed(f"Cert signature algorithm — {sig_alg}")
+
+
+
 # ── Per-host audit ─────────────────────────────────────────────────────────────
 
 def run_audit(target: str, only: set[str] | None = None) -> None:
@@ -1831,10 +2069,15 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         check_tls_versions(target)
         check_tls_ciphers(target)
         check_tls_certificate(target)
+        check_tls_cert_signature(target)
     if all_groups or "http" in only:
         check_http_security(target)
     if all_groups or "smtp" in only:
         check_smtp_starttls(target)
+    if all_groups or "ftp" in only:
+        check_ftp(target)
+    if all_groups or "rdp" in only:
+        check_rdp(target)
 
     c     = _counts()
     total = c["pass"] + c["fail"]
