@@ -16,7 +16,7 @@ python3 --version
 
 Clone the repository and navigate to the tool directory:
 ```bash
-git clone https://github.com/YOUR_USERNAME/ssh-tls-auditor.git
+git clone git clone https://github.com/elin-olsson/ssh-tls-auditor.git
 cd ssh-tls-auditor
 ```
 
