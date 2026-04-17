@@ -102,8 +102,6 @@ _ANSI_YELLOW = "\033[33m"
 _ANSI_BLUE   = "\033[34m"
 _ANSI_RESET  = "\033[0m"
 
-# Grade thresholds: (min_criticals, grade)
-_GRADE_THRESHOLDS = [(0, "A"), (1, "B"), (2, "C"), (4, "D"), (float("inf"), "F")]
 _GRADE_COLOURS = {"A": _ANSI_GREEN, "B": _ANSI_GREEN, "C": _ANSI_YELLOW,
                   "D": _ANSI_YELLOW, "F": _ANSI_RED}
 _BADGE_COLOURS = {"A": "brightgreen", "B": "green", "C": "yellow",
@@ -581,6 +579,7 @@ def check_ssh_host_keys(target: str) -> None:
                     "Host key type",
                     f"RSA {bits}-bit — below recommended minimum of 3072 bits",
                     "Regenerate with a larger key: ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key  or switch to ED25519.",
+                    severity="CRITICAL",
                 )
             else:
                 size_str = f"RSA {bits}-bit" if bits else "RSA"
@@ -686,6 +685,7 @@ def check_ssh_password_auth(target: str) -> None:
             "Password authentication",
             "enabled — probe credentials unexpectedly authenticated",
             "Set PasswordAuthentication no in sshd_config. Ensure key-based auth works first.",
+            severity="CRITICAL",
         )
 
     except paramiko.BadAuthenticationType:
@@ -1726,25 +1726,29 @@ def check_smtp_starttls(target: str) -> None:
 
             try:
                 raw = socket.create_connection((target, port), timeout=_timeout)
-                if not use_implicit_ssl:
-                    # STARTTLS upgrade before wrapping
-                    raw.recv(1024)
-                    raw.sendall(b"EHLO auditor\r\n")
-                    raw.recv(4096)
-                    raw.sendall(b"STARTTLS\r\n")
-                    resp = raw.recv(1024).decode(errors="replace")
-                    if not resp.startswith("220"):
-                        raw.close()
-                        continue
-                wrapped = ctx.wrap_socket(raw, server_hostname=target)
-                wrapped.close()
-                failed(
-                    f"Weak cipher {cipher_name} ({label})",
-                    f"Server accepted {cipher_name} cipher suite.",
-                    "Restrict MTA cipher list to AES-GCM and ChaCha20.",
-                    severity="CRITICAL",
-                )
-            except (ssl.SSLError, OSError):
+                try:
+                    if not use_implicit_ssl:
+                        # STARTTLS upgrade before wrapping
+                        raw.recv(1024)
+                        raw.sendall(b"EHLO auditor\r\n")
+                        raw.recv(4096)
+                        raw.sendall(b"STARTTLS\r\n")
+                        resp = raw.recv(1024).decode(errors="replace")
+                        if not resp.startswith("220"):
+                            continue
+                    wrapped = ctx.wrap_socket(raw, server_hostname=target)
+                    wrapped.close()
+                    failed(
+                        f"Weak cipher {cipher_name} ({label})",
+                        f"Server accepted {cipher_name} cipher suite.",
+                        "Restrict MTA cipher list to AES-GCM and ChaCha20.",
+                        severity="CRITICAL",
+                    )
+                except (ssl.SSLError, OSError):
+                    passed(f"Weak cipher {cipher_name} rejected ({label})")
+                finally:
+                    raw.close()
+            except OSError:
                 passed(f"Weak cipher {cipher_name} rejected ({label})")
 
         # ── Certificate expiry ────────────────────────────────────────────────
@@ -1753,68 +1757,45 @@ def check_smtp_starttls(target: str) -> None:
         ctx_cert.verify_mode = ssl.CERT_NONE
         try:
             raw = socket.create_connection((target, port), timeout=_timeout)
-            if not use_implicit_ssl:
-                raw.recv(1024)
-                raw.sendall(b"EHLO auditor\r\n")
-                raw.recv(4096)
-                raw.sendall(b"STARTTLS\r\n")
-                resp = raw.recv(1024).decode(errors="replace")
-                if not resp.startswith("220"):
-                    raw.close()
-                    raise OSError("STARTTLS rejected")
-            cert_sock = ctx_cert.wrap_socket(raw, server_hostname=target)
-            cert_der = cert_sock.getpeercert(binary_form=True)
-            cert_sock.close()
-            if cert_der:
-                cert = ssl.DER_cert_to_PEM_cert(cert_der)
-                # Parse expiry via a temporary context that validates dates
-                try:
-                    exp_str = cert_sock.getpeercert().get("notAfter", "") if hasattr(cert_sock, "getpeercert") else ""
-                except Exception:
-                    exp_str = ""
-                # Re-fetch the parsed cert
-                raw2 = socket.create_connection((target, port), timeout=_timeout)
-                ctx2 = ssl.create_default_context()
-                ctx2.check_hostname = False
-                ctx2.verify_mode = ssl.CERT_NONE
+            try:
                 if not use_implicit_ssl:
-                    raw2.recv(1024)
-                    raw2.sendall(b"EHLO auditor\r\n")
-                    raw2.recv(4096)
-                    raw2.sendall(b"STARTTLS\r\n")
-                    resp2 = raw2.recv(1024).decode(errors="replace")
-                    if resp2.startswith("220"):
-                        sock2 = ctx2.wrap_socket(raw2, server_hostname=target)
-                    else:
-                        raw2.close()
-                        sock2 = None
-                else:
-                    sock2 = ctx2.wrap_socket(raw2, server_hostname=target)
-
-                if sock2:
-                    parsed = sock2.getpeercert()
-                    sock2.close()
-                    if parsed:
-                        not_after = parsed.get("notAfter", "")
-                        if not_after:
-                            exp_dt = datetime.datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-                            days_left = (exp_dt - datetime.datetime.utcnow()).days
-                            if days_left < 0:
-                                failed(
-                                    f"SMTP cert expired ({label})",
-                                    f"Certificate expired {abs(days_left)} day(s) ago.",
-                                    "Renew the TLS certificate on the mail server.",
-                                    severity="CRITICAL",
-                                )
-                            elif days_left < 30:
-                                failed(
-                                    f"SMTP cert expiry ({label})",
-                                    f"Certificate expires in {days_left} day(s).",
-                                    "Renew the TLS certificate on the mail server.",
-                                    severity="WARNING",
-                                )
-                            else:
-                                passed(f"SMTP cert expiry ({label}) — {days_left} days left")
+                    raw.recv(1024)
+                    raw.sendall(b"EHLO auditor\r\n")
+                    raw.recv(4096)
+                    raw.sendall(b"STARTTLS\r\n")
+                    resp = raw.recv(1024).decode(errors="replace")
+                    if not resp.startswith("220"):
+                        raise OSError("STARTTLS rejected")
+                cert_sock = ctx_cert.wrap_socket(raw, server_hostname=target)
+                parsed = cert_sock.getpeercert()
+                cert_sock.close()
+                if parsed:
+                    not_after = parsed.get("notAfter", "")
+                    if not_after:
+                        exp_dt = datetime.datetime.strptime(
+                            not_after, "%b %d %H:%M:%S %Y %Z"
+                        ).replace(tzinfo=datetime.timezone.utc)
+                        days_left = (
+                            exp_dt - datetime.datetime.now(datetime.timezone.utc)
+                        ).days
+                        if days_left < 0:
+                            failed(
+                                f"SMTP cert expired ({label})",
+                                f"Certificate expired {abs(days_left)} day(s) ago.",
+                                "Renew the TLS certificate on the mail server.",
+                                severity="CRITICAL",
+                            )
+                        elif days_left < 30:
+                            failed(
+                                f"SMTP cert expiry ({label})",
+                                f"Certificate expires in {days_left} day(s).",
+                                "Renew the TLS certificate on the mail server.",
+                                severity="WARNING",
+                            )
+                        else:
+                            passed(f"SMTP cert expiry ({label}) — {days_left} days left")
+            finally:
+                raw.close()
         except (OSError, ssl.SSLError):
             pass
 
