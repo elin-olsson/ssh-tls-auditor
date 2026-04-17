@@ -1025,13 +1025,20 @@ def check_email_security(target: str) -> None:
                     "Consider upgrading to '-all' (hardfail) for stronger enforcement.",
                     severity="WARNING",
                 )
-            elif "-all" in spf_lower or "?all" not in spf_lower:
+            elif "-all" in spf_lower:
                 passed("SPF record", spf)
-            else:
+            elif "?all" in spf_lower:
                 failed(
                     "SPF record",
                     f"SPF uses '?all' (neutral) — provides no protection: {spf}",
                     "Replace '?all' with '-all' (hardfail).",
+                    severity="WARNING",
+                )
+            else:
+                failed(
+                    "SPF record",
+                    f"SPF record has no 'all' mechanism — enforcement is undefined: {spf}",
+                    "Add '-all' at the end of the SPF record to reject unauthorised senders.",
                     severity="WARNING",
                 )
     except dns.exception.DNSException as e:
