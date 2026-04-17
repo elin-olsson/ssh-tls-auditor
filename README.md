@@ -392,3 +392,9 @@ After the audit summary, the tool prints a targeted `sshd_config` section and/or
 | `dnspython` | >= 2.0.0 | CAA DNS record lookup |
 | `ssl` | stdlib | TLS handshake testing |
 | `socket` | stdlib | Port connectivity checks |
+
+---
+
+<p align="center">
+  <img src="logo.png" alt="ssh-tls-auditor logo" width="200">
+</p>
