@@ -6,12 +6,17 @@ Checks one or more target servers for:
   - Open ports (22, 80, 443)
   - SSH algorithms (key exchange, ciphers, MACs)
   - SSH banner / server version
+  - SSH host key type and size
   - SSH root login status
   - SSH password authentication
   - SSH legacy hardware detection (HP iLO, Cisco, Dropbear, etc.)
+  - CAA DNS records and DNSSEC
   - TLS version support (1.0, 1.1, 1.2, 1.3)
+  - TLS cipher suites (NULL, aNULL, EXPORT, RC4, 3DES)
   - TLS certificate (trust, expiry, hostname match)
-  - HTTP → HTTPS redirect and HSTS header
+  - HTTP → HTTPS redirect, HSTS, and security headers (X-Frame-Options, X-Content-Type-Options, CSP)
+
+Each failed check is classified as [CRIT] or [WARN]. Each host receives an A–F grade.
 
 Usage:
     python3 auditor.py <target> [<target> ...]
@@ -23,6 +28,9 @@ Usage:
     python3 auditor.py example.com --only ssh tls
     python3 auditor.py example.com --quiet
     python3 auditor.py example.com --config
+    python3 auditor.py example.com --watch 60
+    python3 auditor.py example.com --badge
+    python3 auditor.py 192.168.1.0/24 --parallel --only ssh
 """
 
 import argparse
