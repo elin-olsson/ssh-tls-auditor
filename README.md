@@ -1,5 +1,7 @@
 ![SSH/TLS Auditor](github-banner.png)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![CI](https://github.com/elin-olsson/ssh-tls-auditor/actions/workflows/ci.yml/badge.svg)](https://github.com/elin-olsson/ssh-tls-auditor/actions/workflows/ci.yml)
+
 A command-line security audit tool that checks a target server for common SSH and TLS misconfigurations. Implemented in Python with no external CLI tools required.
 
 ## Prerequisites
