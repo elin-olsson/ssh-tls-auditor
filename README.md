@@ -525,5 +525,5 @@ quiet    = false
 </p>
 
 <p align="center">
-  <sub>The banner and logo are &copy; 2026 shadofox.se — all rights reserved, not covered by the MIT license.</sub>
+  <sub>The banner and logo are &copy; 2026 shadowfox.se — all rights reserved, not covered by the MIT license.</sub>
 </p>
