@@ -521,7 +521,7 @@ quiet    = false
 ---
 
 <p align="center">
-  <img src="logo.png" alt="nyloggassh-tls-auditor" width="200">
+  <img src="nylogga.png" alt="ssh-tls-auditor logo" width="200">
 </p>
 
 <p align="center">
