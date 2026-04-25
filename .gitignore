@@ -19,9 +19,13 @@ env/
 *.json
 *.html
 
-# Editor / OS
+# Reports and documents
+*.pdf
+
+# Editor / tool directories
 .DS_Store
 .idea/
 .vscode/
 *.swp
 *.swo
+.claude/

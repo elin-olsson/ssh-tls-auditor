@@ -1,4 +1,4 @@
-![SSH/TLS Auditor](github-banner.png)
+![SSH/TLS Auditor](banner.png)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![CI](https://github.com/elin-olsson/ssh-tls-auditor/actions/workflows/ci.yml/badge.svg)](https://github.com/elin-olsson/ssh-tls-auditor/actions/workflows/ci.yml)
 
@@ -521,7 +521,7 @@ quiet    = false
 ---
 
 <p align="center">
-  <img src="nylogga.png" alt="ssh-tls-auditor logo" width="200">
+  <img src="logo.png" alt="ssh-tls-auditor logo" width="200">
 </p>
 
 <p align="center">
