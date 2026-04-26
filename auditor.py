@@ -56,7 +56,7 @@ import urllib.request
 import dns.resolver
 import paramiko
 
-VERSION = "1.7.0"
+VERSION = "1.7.2"
 import paramiko.message
 
 
@@ -89,9 +89,11 @@ class _ThreadLocalStdout:
 
 # ── Module-level configuration ─────────────────────────────────────────────────
 
-_timeout: int = 5
-_quiet:   bool = False
-_config:  bool = False
+_timeout:  int   = 5
+_delay:    float = 0.0
+_ssh_port: int   = 22
+_quiet:    bool  = False
+_config:   bool  = False
 CHECK_GROUPS = ("ports", "ssh", "tls", "http", "smtp", "ftp", "rdp", "email")
 
 # Pre-defined scan profiles — shorthand for common --only combinations
@@ -416,7 +418,7 @@ def _capture_kexinit(target: str) -> tuple[dict, str]:
     with _kex_patch_lock:
         paramiko.Transport._parse_kex_init = capturing
         try:
-            transport = paramiko.Transport((target, 22))
+            transport = paramiko.Transport((target, _ssh_port))
             transport.start_client(timeout=_timeout)
             banner = transport.remote_version or ""
         except Exception:
@@ -433,16 +435,11 @@ def _capture_kexinit(target: str) -> tuple[dict, str]:
 # ── Checks ─────────────────────────────────────────────────────────────────────
 
 def check_open_ports(target: str) -> None:
-    """Check whether ports 22, 80, and 443 are open on the target."""
+    """Check whether the SSH port and standard web ports are open on the target."""
     _thread_local.category = "Port Check"
     print("\n[Port Check]")
 
-    ports = {22: "SSH", 80: "HTTP", 443: "HTTPS"}
-    remediations = {
-        22:  "Ensure sshd is running: sudo systemctl start sshd",
-        80:  "Start your web server and open port 80 in the firewall.",
-        443: "Configure TLS on your web server and open port 443 in the firewall.",
-    }
+    ports = {_ssh_port: "SSH", 80: "HTTP", 443: "HTTPS"}
     for port, label in ports.items():
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -452,11 +449,11 @@ def check_open_ports(target: str) -> None:
             if result == 0:
                 passed(f"Port {port} ({label})", "open")
             else:
-                failed(f"Port {port} ({label})", "closed", remediations[port])
+                info(f"Port {port} ({label})", "closed — skipping audit for this service")
         except socket.gaierror:
             failed(f"Port {port} ({label})", "could not resolve host")
         except socket.timeout:
-            failed(f"Port {port} ({label})", "timed out")
+            info(f"Port {port} ({label})", "timed out — port may be filtered")
 
 
 def check_ssh_algorithms(target: str) -> None:
@@ -597,7 +594,7 @@ def check_ssh_host_keys(target: str) -> None:
 
     transport = None
     try:
-        transport = paramiko.Transport((target, 22))
+        transport = paramiko.Transport((target, _ssh_port))
         transport.start_client(timeout=_timeout)
         host_key = transport.get_remote_server_key()
 
@@ -661,7 +658,7 @@ def check_ssh_root_login(target: str) -> None:
 
     transport = None
     try:
-        transport = paramiko.Transport((target, 22))
+        transport = paramiko.Transport((target, _ssh_port))
         transport.start_client(timeout=_timeout)
         transport.auth_none("root")
         failed(
@@ -716,7 +713,7 @@ def check_ssh_password_auth(target: str) -> None:
 
     transport = None
     try:
-        transport = paramiko.Transport((target, 22))
+        transport = paramiko.Transport((target, _ssh_port))
         transport.start_client(timeout=_timeout)
         transport.auth_password("__audit_probe__", "__audit_wrong_pw_12345__")
         failed(
@@ -2755,6 +2752,7 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
 
     if all_groups or "ports" in only:
         check_open_ports(target)
+        if _delay: time.sleep(_delay)
     if all_groups or "ssh" in only:
         check_ssh_algorithms(target)
         check_ssh_banner(target)
@@ -2762,6 +2760,7 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         check_ssh_root_login(target)
         check_ssh_password_auth(target)
         check_ssh_legacy(target)
+        if _delay: time.sleep(_delay)
     if all_groups or "tls" in only:
         check_dns_caa(target)
         check_dns_dnssec(target)
@@ -2771,15 +2770,20 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
         check_tls_certificate(target)
         check_tls_cert_signature(target)
         check_ocsp(target)
+        if _delay: time.sleep(_delay)
     if all_groups or "http" in only:
         check_http_security(target)
+        if _delay: time.sleep(_delay)
     if all_groups or "smtp" in only:
         check_smtp_starttls(target)
         check_smtp_open_relay(target)
+        if _delay: time.sleep(_delay)
     if all_groups or "ftp" in only:
         check_ftp(target)
+        if _delay: time.sleep(_delay)
     if all_groups or "rdp" in only:
         check_rdp(target)
+        if _delay: time.sleep(_delay)
     if all_groups or "email" in only:
         check_email_security(target)
 
@@ -3037,6 +3041,14 @@ def main() -> None:
         help="connection timeout in seconds (default: 5)",
     )
     parser.add_argument(
+        "--delay", type=float, default=0.0, metavar="SECONDS",
+        help="pause between check groups in seconds (default: 0 — use e.g. 1.0 to avoid triggering IDS/rate limits)",
+    )
+    parser.add_argument(
+        "--ssh-port", type=int, default=22, metavar="PORT",
+        help="SSH port to audit (default: 22 — use e.g. 2022 for non-standard deployments)",
+    )
+    parser.add_argument(
         "--only", nargs="+", choices=list(CHECK_GROUPS), metavar="GROUP",
         help=f"run only the specified check group(s): {', '.join(CHECK_GROUPS)}",
     )
@@ -3074,11 +3086,13 @@ def main() -> None:
         compare_json_reports(args.compare[0], args.compare[1], args.compare[2])
         sys.exit(0)
 
-    global _timeout, _quiet, _config
+    global _timeout, _delay, _ssh_port, _quiet, _config
     # CLI args override config file values
-    _timeout = args.timeout if args.timeout != 5 else file_cfg.get("timeout", 5)
-    _quiet   = args.quiet   or file_cfg.get("quiet",    False)
-    _config  = args.config
+    _timeout  = args.timeout  if args.timeout  != 5    else file_cfg.get("timeout",  5)
+    _delay    = args.delay    if args.delay    != 0.0  else file_cfg.get("delay",    0.0)
+    _ssh_port = args.ssh_port if args.ssh_port != 22   else file_cfg.get("ssh_port", 22)
+    _quiet    = args.quiet    or file_cfg.get("quiet",  False)
+    _config   = args.config
 
     # Resolve check groups: --only > --profile > run all
     if args.only:
