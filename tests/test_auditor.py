@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import auditor
@@ -272,6 +273,52 @@ class TestJsonExport(unittest.TestCase):
             self.assertEqual(data["results"][0]["severity"], "WARNING")
         finally:
             os.unlink(path)
+
+
+# ── External target detection ──────────────────────────────────────────────────
+
+class TestIsExternalTarget(unittest.TestCase):
+    def test_private_rfc1918(self):
+        with patch("socket.gethostbyname", return_value="192.168.1.100"):
+            self.assertFalse(auditor._is_external_target("myhost"))
+
+    def test_loopback(self):
+        with patch("socket.gethostbyname", return_value="127.0.0.1"):
+            self.assertFalse(auditor._is_external_target("localhost"))
+
+    def test_public_ip(self):
+        with patch("socket.gethostbyname", return_value="1.2.3.4"):
+            self.assertTrue(auditor._is_external_target("example.com"))
+
+    def test_10_dot_range(self):
+        with patch("socket.gethostbyname", return_value="10.0.0.50"):
+            self.assertFalse(auditor._is_external_target("internal"))
+
+    def test_172_16_range(self):
+        with patch("socket.gethostbyname", return_value="172.16.5.1"):
+            self.assertFalse(auditor._is_external_target("internal"))
+
+    def test_resolution_failure(self):
+        with patch("socket.gethostbyname", side_effect=OSError):
+            self.assertFalse(auditor._is_external_target("nonexistent.invalid"))
+
+
+# ── Ping check ─────────────────────────────────────────────────────────────────
+
+class TestPingCheck(unittest.TestCase):
+    def test_reachable_host(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            self.assertTrue(auditor._ping_check("192.168.1.1"))
+
+    def test_unreachable_host(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            self.assertFalse(auditor._ping_check("192.168.1.254"))
+
+    def test_subprocess_exception(self):
+        with patch("subprocess.run", side_effect=OSError):
+            self.assertFalse(auditor._ping_check("192.168.1.1"))
 
 
 if __name__ == "__main__":

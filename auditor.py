@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ssh-tls-auditor v1.7.0 — SSH and TLS misconfiguration auditor
+ssh-tls-auditor v1.7.3 — SSH and TLS misconfiguration auditor
 
 Check groups (--only / --profile):
   ports   Open ports (22, 80, 443)
@@ -31,6 +31,7 @@ Usage:
     python3 auditor.py example.com --config
     python3 auditor.py example.com --watch 60
     python3 auditor.py 192.168.1.0/24 --parallel --only ssh
+    python3 auditor.py example.com --skip-ping
 """
 
 import argparse
@@ -56,7 +57,7 @@ import urllib.request
 import dns.resolver
 import paramiko
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 import paramiko.message
 
 
@@ -89,11 +90,12 @@ class _ThreadLocalStdout:
 
 # ── Module-level configuration ─────────────────────────────────────────────────
 
-_timeout:  int   = 5
-_delay:    float = 0.0
-_ssh_port: int   = 22
-_quiet:    bool  = False
-_config:   bool  = False
+_timeout:    int   = 5
+_delay:      float = 0.0
+_ssh_port:   int   = 22
+_quiet:      bool  = False
+_config:     bool  = False
+_skip_ping:  bool  = False
 CHECK_GROUPS = ("ports", "ssh", "tls", "http", "smtp", "ftp", "rdp", "email")
 
 # Pre-defined scan profiles — shorthand for common --only combinations
@@ -162,6 +164,31 @@ def _reset_counts() -> None:
 
 _results: list[dict] = []
 _results_lock = threading.Lock()
+
+
+# ── Pre-scan host checks ───────────────────────────────────────────────────────
+
+def _is_external_target(target: str) -> bool:
+    """Return True if target resolves to a routable (non-private, non-loopback) address."""
+    try:
+        ip = ipaddress.ip_address(socket.gethostbyname(target))
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local)
+    except Exception:
+        return False
+
+
+def _ping_check(target: str) -> bool:
+    """Return True if target responds to a single ICMP echo request."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "2", target],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 # ── Result helpers ─────────────────────────────────────────────────────────────
@@ -2750,6 +2777,21 @@ def run_audit(target: str, only: set[str] | None = None) -> None:
     print(f"  {title}")
     print(f"╚{border}╝")
 
+    if _is_external_target(target):
+        tag = _colourise("[WARN]", _ANSI_YELLOW)
+        print(
+            f"  {tag}  External host — whitelist your IP on the target side "
+            "before scanning to avoid IDS/IPS lockout (see --delay)"
+        )
+
+    if not _skip_ping:
+        if not _ping_check(target):
+            tag = _colourise("[INFO]", _ANSI_BLUE)
+            print(
+                f"  {tag}  Host did not respond to ICMP ping — "
+                "may be unreachable or ICMP is filtered"
+            )
+
     if all_groups or "ports" in only:
         check_open_ports(target)
         if _delay: time.sleep(_delay)
@@ -3077,6 +3119,10 @@ def main() -> None:
         help=f"pre-defined check set: {', '.join(SCAN_PROFILES)} (overridden by --only)",
     )
     parser.add_argument(
+        "--skip-ping", action="store_true",
+        help="skip the ICMP reachability check before scanning (useful when ICMP is filtered)",
+    )
+    parser.add_argument(
         "--version", action="version", version=f"ssh-tls-auditor {VERSION}",
     )
     args = parser.parse_args()
@@ -3086,13 +3132,14 @@ def main() -> None:
         compare_json_reports(args.compare[0], args.compare[1], args.compare[2])
         sys.exit(0)
 
-    global _timeout, _delay, _ssh_port, _quiet, _config
+    global _timeout, _delay, _ssh_port, _quiet, _config, _skip_ping
     # CLI args override config file values
-    _timeout  = args.timeout  if args.timeout  != 5    else file_cfg.get("timeout",  5)
-    _delay    = args.delay    if args.delay    != 0.0  else file_cfg.get("delay",    0.0)
-    _ssh_port = args.ssh_port if args.ssh_port != 22   else file_cfg.get("ssh_port", 22)
-    _quiet    = args.quiet    or file_cfg.get("quiet",  False)
-    _config   = args.config
+    _timeout   = args.timeout  if args.timeout  != 5    else file_cfg.get("timeout",  5)
+    _delay     = args.delay    if args.delay    != 0.0  else file_cfg.get("delay",    0.0)
+    _ssh_port  = args.ssh_port if args.ssh_port != 22   else file_cfg.get("ssh_port", 22)
+    _quiet     = args.quiet    or file_cfg.get("quiet",  False)
+    _config    = args.config
+    _skip_ping = args.skip_ping or file_cfg.get("skip_ping", False)
 
     # Resolve check groups: --only > --profile > run all
     if args.only:
