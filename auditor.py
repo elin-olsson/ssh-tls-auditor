@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ssh-tls-auditor v1.7.3 — SSH and TLS misconfiguration auditor
+ssh-tls-auditor v1.7.4 — SSH and TLS misconfiguration auditor
 
 Check groups (--only / --profile):
   ports   Open ports (22, 80, 443)
@@ -32,6 +32,7 @@ Usage:
     python3 auditor.py example.com --watch 60
     python3 auditor.py 192.168.1.0/24 --parallel --only ssh
     python3 auditor.py example.com --skip-ping
+    python3 auditor.py example.com --conn-delay 0.5
 """
 
 import argparse
@@ -57,7 +58,7 @@ import urllib.request
 import dns.resolver
 import paramiko
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 import paramiko.message
 
 
@@ -92,6 +93,7 @@ class _ThreadLocalStdout:
 
 _timeout:    int   = 5
 _delay:      float = 0.0
+_conn_delay: float = 0.0
 _ssh_port:   int   = 22
 _quiet:      bool  = False
 _config:     bool  = False
@@ -189,6 +191,18 @@ def _ping_check(target: str) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _conn_sleep() -> None:
+    """Sleep _conn_delay seconds before an individual connection attempt."""
+    if _conn_delay:
+        time.sleep(_conn_delay)
+
+
+def _connect(host: str, port: int, timeout: int | None = None) -> socket.socket:
+    """Sleep per-connection delay then open a TCP socket."""
+    _conn_sleep()
+    return socket.create_connection((host, port), timeout=_timeout if timeout is None else timeout)
 
 
 # ── Result helpers ─────────────────────────────────────────────────────────────
@@ -445,6 +459,7 @@ def _capture_kexinit(target: str) -> tuple[dict, str]:
     with _kex_patch_lock:
         paramiko.Transport._parse_kex_init = capturing
         try:
+            _conn_sleep()
             transport = paramiko.Transport((target, _ssh_port))
             transport.start_client(timeout=_timeout)
             banner = transport.remote_version or ""
@@ -469,6 +484,7 @@ def check_open_ports(target: str) -> None:
     ports = {_ssh_port: "SSH", 80: "HTTP", 443: "HTTPS"}
     for port, label in ports.items():
         try:
+            _conn_sleep()
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(_timeout)
             result = sock.connect_ex((target, port))
@@ -621,6 +637,7 @@ def check_ssh_host_keys(target: str) -> None:
 
     transport = None
     try:
+        _conn_sleep()
         transport = paramiko.Transport((target, _ssh_port))
         transport.start_client(timeout=_timeout)
         host_key = transport.get_remote_server_key()
@@ -685,6 +702,7 @@ def check_ssh_root_login(target: str) -> None:
 
     transport = None
     try:
+        _conn_sleep()
         transport = paramiko.Transport((target, _ssh_port))
         transport.start_client(timeout=_timeout)
         transport.auth_none("root")
@@ -740,6 +758,7 @@ def check_ssh_password_auth(target: str) -> None:
 
     transport = None
     try:
+        _conn_sleep()
         transport = paramiko.Transport((target, _ssh_port))
         transport.start_client(timeout=_timeout)
         transport.auth_password("__audit_probe__", "__audit_wrong_pw_12345__")
@@ -913,7 +932,7 @@ def check_tls_versions(target: str) -> None:
             continue
 
         try:
-            with socket.create_connection((target, 443), timeout=_timeout) as raw:
+            with _connect(target, 443) as raw:
                 with ctx.wrap_socket(raw):
                     if should_succeed:
                         passed(label, "supported")
@@ -1262,7 +1281,7 @@ def check_tls_ciphers(target: str) -> None:
             continue  # cipher group not available in this OpenSSL build
 
         try:
-            with socket.create_connection((target, 443), timeout=_timeout) as raw:
+            with _connect(target, 443) as raw:
                 with ctx.wrap_socket(raw) as ssock:
                     negotiated = ssock.cipher()[0] if ssock.cipher() else "unknown"
                     failed(label, f"server accepted {negotiated} — {description}",
@@ -1296,7 +1315,7 @@ def check_tls_certificate(target: str) -> None:
 
     cert = None
     try:
-        with socket.create_connection((target, 443), timeout=_timeout) as raw:
+        with _connect(target, 443) as raw:
             with ctx.wrap_socket(raw, server_hostname=target) as ssock:
                 cert = ssock.getpeercert()
     except ssl.SSLCertVerificationError as e:
@@ -1415,6 +1434,7 @@ def check_http_security(target: str) -> None:
     print("\n[HTTP Security]")
 
     try:
+        _conn_sleep()
         conn = http.client.HTTPConnection(target, 80, timeout=_timeout)
         conn.request("GET", "/", headers={"Host": target,
                                           "User-Agent": "ssh-tls-auditor"})
@@ -1445,6 +1465,7 @@ def check_http_security(target: str) -> None:
     ctx.verify_mode = ssl.CERT_NONE
 
     try:
+        _conn_sleep()
         conn = http.client.HTTPSConnection(target, 443, timeout=_timeout, context=ctx)
         conn.request("HEAD", "/", headers={"Host": target,
                                            "User-Agent": "ssh-tls-auditor"})
@@ -1505,6 +1526,7 @@ def check_http_security(target: str) -> None:
                     try:
                         import urllib.request
                         api_url = f"https://hstspreload.org/api/v2/status?domain={target}"
+                        _conn_sleep()
                         with urllib.request.urlopen(api_url, timeout=_timeout) as r:
                             data = json.loads(r.read().decode())
                         status = data.get("status", "unknown")
@@ -2130,7 +2152,7 @@ _SMTP_WEAK_CIPHERS = {
 def _smtp_connect(host: str, port: int, use_ssl: bool, timeout: int):
     """Return a connected socket (plain or wrapped), or None on failure."""
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
+        sock = _connect(host, port, timeout=timeout)
     except OSError:
         return None
 
@@ -2178,7 +2200,7 @@ def check_smtp_starttls(target: str) -> None:
     reachable_ports: list[int] = []
     for port in _SMTP_PORTS:
         try:
-            with socket.create_connection((target, port), timeout=_timeout):
+            with _connect(target, port):
                 reachable_ports.append(port)
         except OSError:
             pass
@@ -2248,7 +2270,7 @@ def check_smtp_starttls(target: str) -> None:
                 continue
 
             try:
-                raw = socket.create_connection((target, port), timeout=_timeout)
+                raw = _connect(target, port)
                 try:
                     if not use_implicit_ssl:
                         # STARTTLS upgrade before wrapping
@@ -2279,7 +2301,7 @@ def check_smtp_starttls(target: str) -> None:
         ctx_cert.check_hostname = False
         ctx_cert.verify_mode = ssl.CERT_NONE
         try:
-            raw = socket.create_connection((target, port), timeout=_timeout)
+            raw = _connect(target, port)
             try:
                 if not use_implicit_ssl:
                     raw.recv(1024)
@@ -2339,7 +2361,7 @@ def check_smtp_open_relay(target: str) -> None:
     print("\n[SMTP Open Relay]")
 
     try:
-        with socket.create_connection((target, 25), timeout=_timeout) as sock:
+        with _connect(target, 25) as sock:
             def _recv() -> str:
                 buf = b""
                 while True:
@@ -2395,7 +2417,7 @@ def check_ftp(target: str) -> None:
     print("\n[FTP]")
 
     try:
-        with socket.create_connection((target, 21), timeout=_timeout) as sock:
+        with _connect(target, 21) as sock:
             banner = sock.recv(1024).decode(errors="replace").strip()
     except OSError:
         print("  (port 21 closed — skipping)")
@@ -2412,7 +2434,7 @@ def check_ftp(target: str) -> None:
 
     # Check whether the server supports AUTH TLS (explicit FTPS)
     try:
-        with socket.create_connection((target, 21), timeout=_timeout) as sock:
+        with _connect(target, 21) as sock:
             sock.recv(1024)  # banner
             sock.sendall(b"AUTH TLS\r\n")
             resp = sock.recv(1024).decode(errors="replace").strip()
@@ -2452,7 +2474,7 @@ def check_rdp(target: str) -> None:
     print("\n[RDP]")
 
     try:
-        sock = socket.create_connection((target, 3389), timeout=_timeout)
+        sock = _connect(target, 3389)
     except OSError:
         print("  (port 3389 closed — skipping)")
         return
@@ -2649,7 +2671,7 @@ def check_ocsp(target: str) -> None:
     ctx.verify_mode = ssl.CERT_NONE
 
     try:
-        with socket.create_connection((target, 443), timeout=_timeout) as raw:
+        with _connect(target, 443) as raw:
             with ctx.wrap_socket(raw, server_hostname=target) as ssock:
                 cert_der = ssock.getpeercert(binary_form=True)
     except ConnectionRefusedError:
@@ -2678,6 +2700,7 @@ def check_ocsp(target: str) -> None:
             ocsp_url.rstrip("/"),
             headers={"User-Agent": "ssh-tls-auditor"},
         )
+        _conn_sleep()
         with urllib.request.urlopen(req, timeout=_timeout) as resp:
             status_code = resp.status
         if status_code in (200, 400):
@@ -2713,7 +2736,7 @@ def check_tls_cert_signature(target: str) -> None:
     ctx.verify_mode = ssl.CERT_NONE
 
     try:
-        with socket.create_connection((target, 443), timeout=_timeout) as raw:
+        with _connect(target, 443) as raw:
             with ctx.wrap_socket(raw, server_hostname=target) as ssock:
                 cert_der = ssock.getpeercert(binary_form=True)
     except OSError:
@@ -3087,6 +3110,10 @@ def main() -> None:
         help="pause between check groups in seconds (default: 0 — use e.g. 1.0 to avoid triggering IDS/rate limits)",
     )
     parser.add_argument(
+        "--conn-delay", type=float, default=0.0, metavar="SECONDS",
+        help="pause before each individual connection in seconds (default: 0 — use e.g. 0.5 for a softer scan footprint against IDS/IPS)",
+    )
+    parser.add_argument(
         "--ssh-port", type=int, default=22, metavar="PORT",
         help="SSH port to audit (default: 22 — use e.g. 2022 for non-standard deployments)",
     )
@@ -3132,14 +3159,15 @@ def main() -> None:
         compare_json_reports(args.compare[0], args.compare[1], args.compare[2])
         sys.exit(0)
 
-    global _timeout, _delay, _ssh_port, _quiet, _config, _skip_ping
+    global _timeout, _delay, _conn_delay, _ssh_port, _quiet, _config, _skip_ping
     # CLI args override config file values
-    _timeout   = args.timeout  if args.timeout  != 5    else file_cfg.get("timeout",  5)
-    _delay     = args.delay    if args.delay    != 0.0  else file_cfg.get("delay",    0.0)
-    _ssh_port  = args.ssh_port if args.ssh_port != 22   else file_cfg.get("ssh_port", 22)
-    _quiet     = args.quiet    or file_cfg.get("quiet",  False)
-    _config    = args.config
-    _skip_ping = args.skip_ping or file_cfg.get("skip_ping", False)
+    _timeout    = args.timeout    if args.timeout    != 5    else file_cfg.get("timeout",    5)
+    _delay      = args.delay      if args.delay      != 0.0  else file_cfg.get("delay",      0.0)
+    _conn_delay = args.conn_delay if args.conn_delay != 0.0  else file_cfg.get("conn_delay", 0.0)
+    _ssh_port   = args.ssh_port   if args.ssh_port   != 22   else file_cfg.get("ssh_port",   22)
+    _quiet      = args.quiet      or file_cfg.get("quiet",   False)
+    _config     = args.config
+    _skip_ping  = args.skip_ping  or file_cfg.get("skip_ping", False)
 
     # Resolve check groups: --only > --profile > run all
     if args.only:

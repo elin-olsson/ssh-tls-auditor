@@ -275,6 +275,35 @@ class TestJsonExport(unittest.TestCase):
             os.unlink(path)
 
 
+# ── Per-connection delay ───────────────────────────────────────────────────────
+
+class TestConnDelay(unittest.TestCase):
+    def setUp(self):
+        auditor._conn_delay = 0.0
+
+    def tearDown(self):
+        auditor._conn_delay = 0.0
+
+    def test_conn_sleep_skipped_when_zero(self):
+        with patch("time.sleep") as mock_sleep:
+            auditor._conn_sleep()
+            mock_sleep.assert_not_called()
+
+    def test_conn_sleep_called_when_set(self):
+        auditor._conn_delay = 0.3
+        with patch("time.sleep") as mock_sleep:
+            auditor._conn_sleep()
+            mock_sleep.assert_called_once_with(0.3)
+
+    def test_connect_applies_delay(self):
+        auditor._conn_delay = 0.1
+        mock_sock = unittest.mock.MagicMock()
+        with patch("time.sleep") as mock_sleep, \
+             patch("socket.create_connection", return_value=mock_sock):
+            auditor._connect("127.0.0.1", 22)
+            mock_sleep.assert_called_once_with(0.1)
+
+
 # ── External target detection ──────────────────────────────────────────────────
 
 class TestIsExternalTarget(unittest.TestCase):
