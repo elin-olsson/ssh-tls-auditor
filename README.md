@@ -98,6 +98,30 @@ python3 auditor.py example.com --watch 60
 python3 auditor.py example.com --badge
 ```
 
+### Flags
+
+| Flag | Argument | Default | Description |
+|---|---|---|---|
+| `-f`, `--file` | `FILE` | — | Read targets from a file, one per line (`#` comments supported) |
+| `--timeout` | `SECONDS` | `5` | Connection timeout in seconds |
+| `--delay` | `SECONDS` | `0` | Pause between check groups in seconds — use e.g. `1.0` to avoid triggering IDS/rate limits |
+| `--conn-delay` | `SECONDS` | `0` | Pause before each individual connection in seconds — use e.g. `0.5` for a softer scan footprint against IDS/IPS |
+| `--ssh-port` | `PORT` | `22` | SSH port to audit — use e.g. `2022` for non-standard deployments |
+| `--skip-ping` | — | off | Skip the ICMP reachability check before scanning (useful when ICMP is filtered) |
+| `--only` | `GROUP ...` | all | Run only the specified check group(s) |
+| `--profile` | `PROFILE` | — | Pre-defined check set (see table below) |
+| `--parallel` | — | off | Scan multiple targets in parallel |
+| `--quiet` | — | off | Only print `[FAIL]` results — suppress `[PASS]` and `[INFO]` |
+| `--config` | — | off | After each audit, print suggested `sshd_config` / nginx snippets for all failures |
+| `--watch` | `SECONDS` | — | Re-scan every `SECONDS` and show only changes (Ctrl+C to stop) |
+| `--badge` | — | off | Print a Markdown badge for each target after the audit |
+| `--csv` | `FILE` | — | Write results to a CSV file |
+| `--html` | `FILE` | — | Write results to a self-contained HTML report |
+| `--json` | `FILE` | — | Write results to a JSON file |
+| `--markdown` | `FILE` | — | Write results to a Markdown report |
+| `--compare` | `BEFORE AFTER OUT` | — | Diff two JSON reports and write a Markdown summary (no scan performed) |
+| `--version` | — | — | Print the current version and exit |
+
 ### Check groups (`--only`)
 
 | Group | Checks included |
@@ -488,7 +512,7 @@ python3 auditor.py mail.example.com --profile mail
 
 ```bash
 python3 auditor.py --version
-# ssh-tls-auditor 1.7.0
+# ssh-tls-auditor 1.7.4
 ```
 
 ### Configuration file
