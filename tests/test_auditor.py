@@ -275,6 +275,42 @@ class TestJsonExport(unittest.TestCase):
             os.unlink(path)
 
 
+# ── PDF export ─────────────────────────────────────────────────────────────────
+
+class TestPdfExport(unittest.TestCase):
+    def setUp(self):
+        _reset()
+
+    def tearDown(self):
+        _reset()
+
+    def test_writes_valid_pdf_header(self):
+        auditor.passed("check")
+        auditor.failed("weak cipher", "3DES offered", "disable 3DES", severity="WARNING")
+        auditor.failed("legacy tls", "TLS 1.0 enabled", "disable TLS 1.0", severity="CRITICAL")
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        try:
+            auditor.write_pdf(path, ["test.com"])
+            with open(path, "rb") as f:
+                data = f.read()
+            self.assertTrue(data.startswith(b"%PDF-1.4"))
+            self.assertTrue(data.endswith(b"%%EOF") or data.rstrip().endswith(b"%%EOF"))
+        finally:
+            os.unlink(path)
+
+    def test_skips_hosts_with_no_results(self):
+        auditor.passed("check")
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        try:
+            # "other.com" has no recorded results and must not crash write_pdf
+            auditor.write_pdf(path, ["test.com", "other.com"])
+            self.assertTrue(os.path.getsize(path) > 0)
+        finally:
+            os.unlink(path)
+
+
 # ── Per-connection delay ───────────────────────────────────────────────────────
 
 class TestConnDelay(unittest.TestCase):

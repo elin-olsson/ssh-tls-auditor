@@ -60,6 +60,9 @@ python3 auditor.py example.com --json report.json
 # Save results to a Markdown report
 python3 auditor.py example.com --markdown report.md
 
+# Save results to a client-ready PDF report
+python3 auditor.py example.com --pdf report.pdf
+
 # Compare two JSON reports and write a Markdown diff
 python3 auditor.py --compare before.json after.json diff.md
 
@@ -119,6 +122,7 @@ python3 auditor.py example.com --badge
 | `--html` | `FILE` | — | Write results to a self-contained HTML report |
 | `--json` | `FILE` | — | Write results to a JSON file |
 | `--markdown` | `FILE` | — | Write results to a Markdown report |
+| `--pdf` | `FILE` | — | Write results to a client-ready PDF report |
 | `--compare` | `BEFORE AFTER OUT` | — | Diff two JSON reports and write a Markdown summary (no scan performed) |
 | `--version` | — | — | Print the current version and exit |
 
@@ -418,6 +422,16 @@ python3 auditor.py example.com --markdown report.md
 
 Each host section shows the grade, failure count, and a table of failed checks with severity icons. Passed checks are collapsed into a `<details>` block. The output renders well on GitHub, in editors with Markdown preview, and in documentation sites.
 
+### PDF report
+
+Use `--pdf <file>` to generate a paginated PDF report suitable for handing to a client after an engagement:
+
+```bash
+python3 auditor.py example.com --pdf report.pdf
+```
+
+Each host gets its own section with the grade, failure/pass counts, and the failed checks grouped by category with remediation notes inline. Built with a small dependency-free PDF writer (no LaTeX, no headless browser) so it needs nothing beyond the Python standard library.
+
 ### Comparison report
 
 Use `--compare <before> <after> <out>` to diff two JSON reports and produce a Markdown summary of what changed. No scan is performed — the command reads the two files and exits:
@@ -512,7 +526,7 @@ python3 auditor.py mail.example.com --profile mail
 
 ```bash
 python3 auditor.py --version
-# ssh-tls-auditor 1.7.4
+# ssh-tls-auditor 1.8.0
 ```
 
 ### Configuration file
@@ -543,6 +557,7 @@ quiet    = false
 | `ssl` | stdlib | TLS handshake testing (TLS, SMTP, FTP) |
 | `socket` | stdlib | Port connectivity checks (all protocols) |
 | `urllib` | stdlib | HSTS preload API query |
+| `shadowfox_pdf` | vendored | Dependency-free PDF report writer, bundled in this repo (`shadowfox_pdf.py`) |
 
 ---
 

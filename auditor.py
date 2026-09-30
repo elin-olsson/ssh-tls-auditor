@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ssh-tls-auditor v1.7.4 — SSH and TLS misconfiguration auditor
+ssh-tls-auditor v1.8.0 — SSH and TLS misconfiguration auditor
 
 Check groups (--only / --profile):
   ports   Open ports (22, 80, 443)
@@ -27,6 +27,7 @@ Usage:
     python3 auditor.py example.com --html report.html
     python3 auditor.py example.com --json report.json
     python3 auditor.py example.com --markdown report.md
+    python3 auditor.py example.com --pdf report.pdf
     python3 auditor.py --compare before.json after.json diff.md
     python3 auditor.py example.com --config
     python3 auditor.py example.com --watch 60
@@ -58,7 +59,9 @@ import urllib.request
 import dns.resolver
 import paramiko
 
-VERSION = "1.7.4"
+from shadowfox_pdf import PDFReport, BLACK, GREY, GREEN, RED, ORANGE, BLUE, DEEP_RED
+
+VERSION = "1.8.0"
 import paramiko.message
 
 
@@ -1744,6 +1747,61 @@ def write_markdown(path: str, targets: list[str]) -> None:
     print(f"Results written to {path}")
 
 
+# ── PDF export ─────────────────────────────────────────────────────────────────
+
+def write_pdf(path: str, targets: list[str]) -> None:
+    """Write a client-ready PDF audit report grouped by host then category."""
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    from collections import defaultdict
+    by_host: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for r in _results:
+        by_host[r["host"]][r["category"]].append(r)
+
+    sev_color = {"CRITICAL": DEEP_RED, "WARNING": ORANGE}
+    grade_color = {"A": GREEN, "B": GREEN, "C": ORANGE, "D": ORANGE, "F": RED}
+
+    report = PDFReport("ssh-tls-auditor", "SSH/TLS Audit Report")
+    report.heading("SSH/TLS Audit Report")
+    report.subheading(f"Generated {now}")
+    report.rule()
+
+    for host in targets:
+        if host not in by_host:
+            continue
+        grade = compute_grade(host)
+        fail_count = sum(1 for r in _results if r["host"] == host and r["result"] == "FAIL")
+        pass_count = sum(1 for r in _results if r["host"] == host and r["result"] == "PASS")
+        report.heading(host, size=14)
+        report.text(
+            f"Grade: {grade}    Failures: {fail_count}    Passed: {pass_count}",
+            bold=True, color=grade_color.get(grade, BLACK),
+        )
+        report.spacer(4)
+
+        for category, rows in by_host[host].items():
+            fail_rows = [r for r in rows if r["result"] == "FAIL"]
+            pass_rows = [r for r in rows if r["result"] == "PASS"]
+            if not fail_rows and not pass_rows:
+                continue
+            report.subheading(category)
+            for r in fail_rows:
+                tag = "CRIT" if r["severity"] == "CRITICAL" else "WARN"
+                color = sev_color.get(r["severity"], ORANGE)
+                detail = r["detail"]
+                if r["remediation"]:
+                    fix = f"fix: {r['remediation']}"
+                    detail = f"{detail} — {fix}" if detail else fix
+                report.severity_line(tag, r["check"], detail, color)
+            if pass_rows:
+                report.text(f"{len(pass_rows)} check(s) passed", size=8.5, color=GREY)
+            report.spacer(6)
+        report.rule()
+
+    report.save(path)
+    print(f"Results written to {path}")
+
+
 # ── Comparison report ─────────────────────────────────────────────────────────
 
 def compare_json_reports(before_path: str, after_path: str, out_path: str) -> None:
@@ -3098,6 +3156,10 @@ def main() -> None:
         help="write results to a Markdown report",
     )
     parser.add_argument(
+        "--pdf", metavar="FILE",
+        help="write results to a client-ready PDF report",
+    )
+    parser.add_argument(
         "--compare", nargs=3, metavar=("BEFORE", "AFTER", "OUT"),
         help="compare two JSON reports and write a Markdown diff (no scan needed)",
     )
@@ -3280,6 +3342,9 @@ def main() -> None:
 
     if args.markdown:
         write_markdown(args.markdown, targets)
+
+    if args.pdf:
+        write_pdf(args.pdf, targets)
 
     if args.badge:
         print("\nMarkdown badges:")
