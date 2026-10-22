@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![CI](https://github.com/elin-olsson/ssh-tls-auditor/actions/workflows/ci.yml/badge.svg)](https://github.com/elin-olsson/ssh-tls-auditor/actions/workflows/ci.yml)
 
-A command-line security audit tool that checks a target server for common SSH and TLS misconfigurations. Implemented in Python with no external CLI tools required.
+A command-line security audit tool that checks a target server for common misconfigurations in SSH, TLS, HTTP, SMTP, FTP, RDP and email DNS records (SPF, DKIM, DMARC). Implemented in Python with no external CLI tools required.
 
 ## Prerequisites
 
@@ -552,8 +552,8 @@ quiet    = false
 
 | Package | Version | Purpose |
 |---|---|---|
-| `paramiko` | >= 4.0.0 | SSH connection and algorithm enumeration |
-| `dnspython` | >= 2.0.0 | CAA DNS record lookup |
+| `paramiko` | >= 5.0.0 | SSH connection and algorithm enumeration |
+| `dnspython` | >= 2.8.0 | DNS lookups — CAA, DNSSEC, TLSA, SPF, DKIM, DMARC |
 | `ssl` | stdlib | TLS handshake testing (TLS, SMTP, FTP) |
 | `socket` | stdlib | Port connectivity checks (all protocols) |
 | `urllib` | stdlib | HSTS preload API query |
